@@ -8,6 +8,9 @@
 package main
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/signal"
@@ -246,6 +249,40 @@ func main() {
 		}
 	}()
 
+	// quick and dirty way to set up two scion enabled peers
+	var cfgs, endpointCfgs [2]string
+	prv1, _ := base64.StdEncoding.DecodeString("AEfR+ZyoCCHQASR4bsYxyW2rCsL+1qXCPDbOtHFVQkE=")
+	pub1, _ := base64.StdEncoding.DecodeString("u0bh4qMb5ezU+m7td0W24bBCOdoKP1QuU0m9WOXu2k4=")
+	prv2, _ := base64.StdEncoding.DecodeString("SAA0fpFPKXbdvYsQRSXKwbxFmie6LhEp03n46FyIS1M=")
+	pub2, _ := base64.StdEncoding.DecodeString("uJx86Yq719+NjgblW2PdfkI+NXOS6GPThuGkZfzNhyw=")
+
+	cfgs[0] = uapiCfg(
+		"private_key", hex.EncodeToString(prv1),
+		"listen_port", "51820",
+		"public_key", hex.EncodeToString(pub1),
+		"allowed_ip", "10.5.5.2/32",
+		"endpoint", "1-152,10.152.0.71:51822",
+	)
+
+	cfgs[1] = uapiCfg(
+		"private_key", hex.EncodeToString(prv2),
+		"listen_port", "51822",
+		"public_key", hex.EncodeToString(pub2),
+		"allowed_ip", "10.5.5.0/24",
+		"endpoint", "1-150,10.150.0.71:51820",
+	)
+
+	endpointCfgs[0] = uapiCfg(
+		"public_key", "hex.EncodeToString(pub1[:])",
+		"endpoint", "1-150,10.150.0.71:51820",
+	)
+	env_wg := os.Getenv("node_id")
+	if env_wg == "1" {
+		device.IpcSet(cfgs[0])
+	} else if env_wg == "2" {
+		device.IpcSet(cfgs[1])
+	}
+
 	logger.Verbosef("UAPI listener started")
 
 	// wait for program to terminate
@@ -265,4 +302,20 @@ func main() {
 	device.Close()
 
 	logger.Verbosef("Shutting down")
+}
+
+func uapiCfg(cfg ...string) string {
+	if len(cfg)%2 != 0 {
+		panic("odd number of args to uapiReader")
+	}
+	buf := new(bytes.Buffer)
+	for i, s := range cfg {
+		buf.WriteString(s)
+		sep := byte('\n')
+		if i%2 == 0 {
+			sep = '='
+		}
+		buf.WriteByte(sep)
+	}
+	return buf.String()
 }

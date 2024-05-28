@@ -16,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/netsec-ethz/scion-apps/pkg/pan"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
@@ -35,6 +36,8 @@ type StdNetBind struct {
 	ipv6          *net.UDPConn
 	ipv4PC        *ipv4.PacketConn // will be nil on non-Linux
 	ipv6PC        *ipv6.PacketConn // will be nil on non-Linux
+	scion         pan.ListenConn
+	selector      pan.ReplySelector
 	ipv4TxOffload bool
 	ipv4RxOffload bool
 	ipv6TxOffload bool
@@ -76,6 +79,7 @@ func NewStdNetBind() Bind {
 type StdNetEndpoint struct {
 	// AddrPort is the endpoint destination.
 	netip.AddrPort
+	saddr *pan.UDPAddr
 	// src is the current sticky source address and interface index, if
 	// supported. Typically this is a PKTINFO structure from/for control
 	// messages, see unix.PKTINFO for an example.
@@ -88,6 +92,15 @@ var (
 )
 
 func (*StdNetBind) ParseEndpoint(s string) (Endpoint, error) {
+	saddr, err := pan.ResolveUDPAddr(context.Background(), s)
+	if err == nil {
+		fmt.Println("StdNetBind.ParseEndpoint: saddr:", saddr.String())
+		return &StdNetEndpoint{
+			AddrPort: netip.AddrPortFrom(saddr.IP, uint16(saddr.Port)),
+			saddr:    &saddr,
+		}, nil
+	}
+
 	e, err := netip.ParseAddrPort(s)
 	if err != nil {
 		return nil, err
@@ -116,6 +129,9 @@ func (e *StdNetEndpoint) DstToBytes() []byte {
 }
 
 func (e *StdNetEndpoint) DstToString() string {
+	if e.saddr != nil {
+		return e.saddr.String()
+	}
 	return e.AddrPort.String()
 }
 
@@ -137,6 +153,26 @@ func listenNet(network string, port int) (*net.UDPConn, int, error) {
 	return conn.(*net.UDPConn), uaddr.Port, nil
 }
 
+func listenNetScion(network string, port int) (pan.ListenConn, pan.ReplySelector, int, error) {
+	var local netip.AddrPort
+	if port != 0 {
+		local = netip.AddrPortFrom(netip.Addr{}, uint16(port))
+	}
+	selector := pan.NewDefaultReplySelector()
+	conn, err := pan.ListenUDP(context.Background(), netip.AddrPort(local), selector)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	// Retrieve port.
+	laddr := conn.LocalAddr()
+	uaddr, err := pan.ResolveUDPAddr(context.Background(), laddr.String())
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	return conn, selector, int(uaddr.Port), nil
+}
+
 func (s *StdNetBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -144,7 +180,7 @@ func (s *StdNetBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
 	var err error
 	var tries int
 
-	if s.ipv4 != nil || s.ipv6 != nil {
+	if s.ipv4 != nil || s.ipv6 != nil || s.scion != nil {
 		return nil, 0, ErrBindAlreadyOpen
 	}
 
@@ -155,6 +191,13 @@ again:
 	var v4conn, v6conn *net.UDPConn
 	var v4pc *ipv4.PacketConn
 	var v6pc *ipv6.PacketConn
+	var sconn pan.ListenConn
+	var selector pan.ReplySelector
+
+	sconn, selector, port, err = listenNetScion("udp4", port)
+	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
+		return nil, 0, err
+	}
 
 	v4conn, port, err = listenNet("udp4", port)
 	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
@@ -190,6 +233,11 @@ again:
 		}
 		fns = append(fns, s.makeReceiveIPv6(v6pc, v6conn, s.ipv6RxOffload))
 		s.ipv6 = v6conn
+	}
+	if sconn != nil {
+		fns = append(fns, s.makeReceiveScion(sconn))
+		s.scion = sconn
+		s.selector = selector
 	}
 	if len(fns) == 0 {
 		return nil, 0, syscall.EAFNOSUPPORT
@@ -277,6 +325,31 @@ func (s *StdNetBind) receiveIP(
 	return numMsgs, nil
 }
 
+func (s *StdNetBind) receiveScion(
+	conn pan.ListenConn,
+	bufs [][]byte,
+	sizes []int,
+	eps []Endpoint,
+) (n int, err error) {
+	msgs := s.getMessages()
+	for i := range bufs {
+		(*msgs)[i].Buffers[0] = bufs[i]
+		(*msgs)[i].OOB = (*msgs)[i].OOB[:cap((*msgs)[i].OOB)]
+	}
+	defer s.putMessages(msgs)
+	msg := &(*msgs)[0]
+	msg.N, msg.Addr, err = conn.ReadFrom(msg.Buffers[0])
+	if err != nil {
+		return 0, err
+	}
+	numMsgs := 1
+	sizes[0] = msg.N
+	saddr, _ := pan.ResolveUDPAddr(context.Background(), msg.Addr.String())
+	ep := &StdNetEndpoint{AddrPort: netip.AddrPortFrom(saddr.IP, uint16(saddr.Port)), saddr: &saddr}
+	eps[0] = ep
+	return numMsgs, nil
+}
+
 func (s *StdNetBind) makeReceiveIPv4(pc *ipv4.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
 		return s.receiveIP(pc, conn, rxOffload, bufs, sizes, eps)
@@ -286,6 +359,12 @@ func (s *StdNetBind) makeReceiveIPv4(pc *ipv4.PacketConn, conn *net.UDPConn, rxO
 func (s *StdNetBind) makeReceiveIPv6(pc *ipv6.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
 		return s.receiveIP(pc, conn, rxOffload, bufs, sizes, eps)
+	}
+}
+
+func (s *StdNetBind) makeReceiveScion(conn pan.ListenConn) ReceiveFunc {
+	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
+		return s.receiveScion(conn, bufs, sizes, eps)
 	}
 }
 
@@ -312,6 +391,10 @@ func (s *StdNetBind) Close() error {
 		err2 = s.ipv6.Close()
 		s.ipv6 = nil
 		s.ipv6PC = nil
+	}
+	if s.scion != nil {
+		s.scion.Close()
+		s.scion = nil
 	}
 	s.blackhole4 = false
 	s.blackhole6 = false
@@ -340,6 +423,53 @@ func (e ErrUDPGSODisabled) Unwrap() error {
 
 func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint) error {
 	s.mu.Lock()
+	isScion := endpoint.(*StdNetEndpoint).saddr != nil
+	sconn := s.scion
+	s.mu.Unlock()
+	if isScion {
+
+		remote := endpoint.(*StdNetEndpoint).saddr
+		if sconn == nil {
+			return syscall.EAFNOSUPPORT
+		}
+		if s.selector.Path(*remote) == nil {
+			s.selector.(*pan.DefaultReplySelector).RecordPathsToRemote(*remote)
+			fmt.Println("StdNetBind.Send: s.selector.Path(*remote):", s.selector.Path(*remote))
+		}
+		addr := endpoint.(*StdNetEndpoint).saddr
+		addr3 := pan.UDPAddr{
+			IA:   addr.IA,
+			IP:   addr.IP,
+			Port: addr.Port,
+		}
+
+		// msgs := s.getMessages()
+		// defer s.putMessages(msgs)
+		for i := range bufs {
+			// (*msgs)[i].Addr = endpoint.(*StdNetEndpoint).saddr
+			// (*msgs)[i].Buffers[0] = bufs[i]
+			_, err := sconn.WriteTo(bufs[i], addr3)
+			if err != nil {
+				return err
+			}
+
+		}
+		// for _, msg := range *msgs {
+		// 	addr := endpoint.(*StdNetEndpoint).saddr
+		// 	addr3 := pan.UDPAddr{
+		// 		IA:   addr.IA,
+		// 		IP:   addr.IP,
+		// 		Port: addr.Port,
+		// 	}
+		// 	// udpaddr := addr.(*net.Addr)
+		// 	_, err := sconn.WriteTo(msg.Buffers[0], addr3)
+		// 	if err != nil {
+		// 		return err
+		// 	}
+		// }
+		return nil
+	}
+	s.mu.Lock()
 	blackhole := s.blackhole4
 	conn := s.ipv4
 	offload := s.ipv4TxOffload
@@ -352,6 +482,7 @@ func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint) error {
 		is6 = true
 		offload = s.ipv6TxOffload
 	}
+
 	s.mu.Unlock()
 
 	if blackhole {
