@@ -16,7 +16,6 @@ import (
 
 const (
 	DefaultSCIONDaemonAddr = "127.0.0.1:30255"
-	DefaultTopologyFile    = "/etc/scion/topology.json"
 )
 
 // LoadScionConfigFromEnv loads SCION configuration from environment variables
@@ -49,13 +48,6 @@ func LoadScionConfigFromEnv() (*ScionConfig, error) {
 		config.LocalIA = ia
 	} else {
 		return nil, fmt.Errorf("SCION_LOCAL_IA environment variable is required")
-	}
-
-	// Topology file
-	if topology := os.Getenv("SCION_TOPOLOGY_FILE"); topology != "" {
-		config.TopologyFile = topology
-	} else {
-		config.TopologyFile = DefaultTopologyFile
 	}
 
 	// Path policy

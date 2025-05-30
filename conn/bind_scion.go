@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/daemon"
@@ -22,7 +23,7 @@ var (
 	_ Bind = (*ScionNetBind)(nil)
 )
 
-// ScionNetBind implements Bind for SCION networks with fallback to standard IP.
+// ScionNetBind implements Bind for SCION networks
 type ScionNetBind struct {
 	mu     sync.Mutex
 	logger Logger
@@ -34,13 +35,14 @@ type ScionNetBind struct {
 	daemonService daemon.Service
 	daemonConn    daemon.Connector
 
-
 	// Path management
-	pathPolicy PathPolicy
-	pathMu     sync.RWMutex
+	pathPolicy  PathPolicy
+	pathManager *PathManager
+	pathMu      sync.RWMutex
 
 	// Configuration
 	config *ScionConfig
+
 
 	// State
 	closed bool
@@ -50,7 +52,6 @@ type ScionNetBind struct {
 type ScionConfig struct {
 	DaemonAddr   string
 	LocalAS      addr.AS
-	TopologyFile string
 	PathPolicy   PathPolicy
 	LocalIA      addr.IA
 	LocalIP      net.IP
@@ -126,7 +127,7 @@ func (s *ScionNetBind) initSCION() error {
 	// Set up daemon service
 	daemonAddr := s.config.DaemonAddr
 	if daemonAddr == "" {
-		daemonAddr = s.config.DaemonAddr
+		daemonAddr = DefaultSCIONDaemonAddr
 	}
 
 	s.daemonService = daemon.Service{
@@ -156,13 +157,19 @@ func (s *ScionNetBind) initSCION() error {
 
 	// Initialize SCION network with proper topology
 	s.scionNetwork = &snet.SCIONNetwork{
-		Topology: &scionTopology{
-			localIA: localIA,
-			daemon:  s.daemonConn,
-		},
-		// ReplyPather: &defaultReplyPather{},
-		Metrics: snet.SCIONNetworkMetrics{},
+		Topology:    s.daemonConn,
+		ReplyPather: snet.DefaultReplyPather{},
+		Metrics:     snet.SCIONNetworkMetrics{},
 	}
+
+	s.pathManager = NewPathManager(
+		s.daemonConn,        // SCION daemon connection
+		s.config.LocalIA,    // our IA
+		s.config.PathPolicy, // selection policy
+		s.logger,
+		WithRefreshInterval(1*time.Minute),
+	)
+	s.pathManager.Start()
 
 	s.pathPolicy = s.config.PathPolicy
 	s.logger.Verbosef("SCION network initialized with IA", s.config.LocalIA)
@@ -221,7 +228,6 @@ func (s *ScionNetBind) makeReceiveSCION() ReceiveFunc {
 
 		// Read packet from SCION connection
 		buffer := bufs[0]
-		fmt.Println("buffer:", len(buffer))
 		readBytes, remote, err := s.scionConn.ReadFrom(buffer)
 		if err != nil {
 			fmt.Println("Error reading from SCION connection:", err)
@@ -233,6 +239,11 @@ func (s *ScionNetBind) makeReceiveSCION() ReceiveFunc {
 		if scionAddr, ok := remote.(*snet.UDPAddr); ok {
 			eps[0] = &ScionNetEndpoint{
 				scionAddr: scionAddr,
+			}
+			s.pathManager.RegisterEndpoint(scionAddr.IA)
+			if p := s.pathManager.SelectPath(scionAddr.IA); p != nil {
+				scionAddr.Path = p.Dataplane()
+				scionAddr.NextHop = p.UnderlayNextHop()
 			}
 		} else {
 			// Fallback if it's not a SCION address
@@ -250,6 +261,12 @@ func (s *ScionNetBind) Close() error {
 	s.closed = true
 
 	var err1, err2, err3 error
+
+	if s.pathManager != nil {
+		s.pathManager.Close()
+		s.pathManager = nil
+	}
+
 	if s.scionConn != nil {
 		err1 = s.scionConn.Close()
 		s.scionConn = nil
@@ -303,9 +320,15 @@ func (s *ScionNetBind) ParseEndpoint(str string) (Endpoint, error) {
 	if strings.Contains(str, ",") {
 		scionAddr, err := snet.ParseUDPAddr(str)
 		if err == nil {
-			return &ScionNetEndpoint{
+			scionEndpoint := &ScionNetEndpoint{
 				scionAddr: scionAddr,
-			}, nil
+			}
+			s.pathManager.RegisterEndpoint(scionAddr.IA)
+			if p := s.pathManager.SelectPath(scionAddr.IA); p != nil {
+				scionAddr.Path = p.Dataplane()
+				scionAddr.NextHop = p.UnderlayNextHop()
+			}
+			return scionEndpoint, nil
 		}
 	}
 
@@ -322,6 +345,7 @@ func (s *ScionNetBind) SetPathPolicy(policy PathPolicy) {
 	defer s.pathMu.Unlock()
 	s.pathPolicy = policy
 }
+
 // ScionNetEndpoint implementations
 func (e *ScionNetEndpoint) ClearSrc() {
 
@@ -378,36 +402,3 @@ func (e *ScionNetEndpoint) GetScionAddr() *snet.UDPAddr {
 func (e *ScionNetEndpoint) SetScionAndIPAddresses(scionAddr *snet.UDPAddr) {
 	e.scionAddr = scionAddr
 }
-
-// scionTopology implements the Topology interface for SCION
-type scionTopology struct {
-	localIA addr.IA
-	daemon  daemon.Connector
-}
-
-func (t *scionTopology) LocalIA(ctx context.Context) (addr.IA, error) {
-	return t.localIA, nil
-}
-
-func (t *scionTopology) PortRange(ctx context.Context) (uint16, uint16, error) {
-	// Return default port range for SCION dispatcher
-	return 30061, 30061, nil
-}
-
-func (t *scionTopology) Interfaces(ctx context.Context) (map[uint16]netip.AddrPort, error) {
-	// For basic implementation, return empty map
-	// In a full implementation, this would query the daemon for interface information
-	return make(map[uint16]netip.AddrPort), nil
-}
-
-// // defaultReplyPather implements the ReplyPather interface
-// type defaultReplyPather struct{}
-
-// func (r *defaultReplyPather) ReplyPath(rawPath snet.RawPath) (snet.DataplanePath, error) {
-// 	if len(rawPath.Raw) == 0 {
-// 		return nil, fmt.Errorf("empty raw path provided")
-// 	}
-// 	// In a basic implementation, return the raw path as dataplane path
-// 	// A full implementation would need to properly reverse the path
-// 	return rawPath, nil
-// }
