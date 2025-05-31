@@ -30,7 +30,7 @@ import (
 // refreshInterval is the default cadence at which the manager re‑resolves
 // paths.  Callers may override this by passing WithRefreshInterval when
 // building the PathManager.
-const refreshInterval = 30 * time.Second
+const refreshInterval = 5 * time.Minute
 
 // PathManager maintains fresh SCION paths for all remote IAs that the program
 // has seen so far.  All public methods are concurrency‑safe.
@@ -77,6 +77,7 @@ func NewPathManager(d daemon.Connector, localIA addr.IA, pol PathPolicy, log Log
 		opt(pm)
 	}
 	pm.ctx, pm.cancel = context.WithCancel(context.Background())
+	pm.Start()
 	return pm
 }
 
@@ -157,6 +158,7 @@ func (pm *PathManager) SelectPath(ia addr.IA) snet.Path {
 }
 
 func (pm *PathManager) refreshAll() {
+	pm.log.Verbosef("Refreshing all paths")
 	pm.mu.RLock()
 	dests := make([]addr.IA, 0, len(pm.cache))
 	for ia := range pm.cache {

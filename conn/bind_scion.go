@@ -43,19 +43,18 @@ type ScionNetBind struct {
 	// Configuration
 	config *ScionConfig
 
-
 	// State
 	closed bool
 }
 
 // ScionConfig holds SCION-specific configuration
 type ScionConfig struct {
-	DaemonAddr   string
-	LocalAS      addr.AS
-	PathPolicy   PathPolicy
-	LocalIA      addr.IA
-	LocalIP      net.IP
-	LocalPort    uint16
+	DaemonAddr string
+	LocalAS    addr.AS
+	PathPolicy PathPolicy
+	LocalIA    addr.IA
+	LocalIP    net.IP
+	LocalPort  uint16
 }
 
 type PathPolicy int
@@ -239,11 +238,6 @@ func (s *ScionNetBind) makeReceiveSCION() ReceiveFunc {
 		if scionAddr, ok := remote.(*snet.UDPAddr); ok {
 			eps[0] = &ScionNetEndpoint{
 				scionAddr: scionAddr,
-			}
-			s.pathManager.RegisterEndpoint(scionAddr.IA)
-			if p := s.pathManager.SelectPath(scionAddr.IA); p != nil {
-				scionAddr.Path = p.Dataplane()
-				scionAddr.NextHop = p.UnderlayNextHop()
 			}
 		} else {
 			// Fallback if it's not a SCION address
