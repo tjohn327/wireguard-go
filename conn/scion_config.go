@@ -22,7 +22,7 @@ const (
 func LoadScionConfigFromEnv() (*ScionConfig, error) {
 	config := &ScionConfig{
 		DaemonAddr:   DefaultSCIONDaemonAddr,
-		PathPolicy:   PathPolicyFirst,
+		PathPolicy:   PathPolicyShortest,
 	}
 
 	// SCION daemon address
