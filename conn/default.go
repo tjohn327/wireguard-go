@@ -8,7 +8,8 @@
 package conn
 
 import (
-	"log"
+	"os"
+	"reflect"
 )
 
 func NewDefaultBind() Bind {
@@ -22,16 +23,19 @@ func NewDefaultBindWithLogger(logger any) Bind {
 		// Handle the device.Logger struct type
 		scionLogger = &LoggerWrapper{logger}
 	}
-	// Check if SCION is present
-	config, err := LoadScionConfigFromEnv()
-	if err == nil && config != nil {
-		if scionLogger != nil {
-			scionLogger.Verbosef("Using SCION bind: %s", config.String())
+
+	if os.Getenv("USE_SCION") == "1" {
+		// Check if SCION is present
+		config, err := LoadScionConfigFromEnv()
+		if err == nil && config != nil {
+			if scionLogger != nil {
+				scionLogger.Verbosef("Using SCION bind: %s", config.String())
+			}
+			return NewScionNetBind(config, scionLogger)
 		}
-		return NewScionNetBind(config, scionLogger)
-	}
-	if scionLogger != nil {
-		scionLogger.Errorf("Failed to load SCION config: %v, falling back to standard bind", err)
+		if scionLogger != nil {
+			scionLogger.Errorf("Failed to load SCION config: %v, falling back to standard bind", err)
+		}
 	}
 
 	// Fallback to standard bind
@@ -47,30 +51,41 @@ type LoggerWrapper struct {
 }
 
 func (w *LoggerWrapper) Verbosef(format string, args ...interface{}) {
-	log.Printf("DEBUG: %s %v\n", format, args)
 	if w.logger == nil {
 		return
 	}
-	// Handle device.Logger struct
-	if deviceLogger, ok := w.logger.(struct {
-		Verbosef func(format string, args ...interface{})
-		Errorf   func(format string, args ...interface{})
-	}); ok && deviceLogger.Errorf != nil {
-		deviceLogger.Verbosef(format, args...)
+
+	// Use reflection to call Verbosef
+	val := reflect.ValueOf(w.logger)
+	if val.Kind() == reflect.Ptr {
+		val = val.Elem()
+	}
+	verbosef := val.FieldByName("Verbosef")
+	if verbosef.IsValid() && !verbosef.IsNil() {
+		verbosef.Call([]reflect.Value{
+			reflect.ValueOf(format),
+			reflect.ValueOf(args),
+		})
 	}
 }
 
 func (w *LoggerWrapper) Errorf(format string, args ...interface{}) {
-	log.Printf("ERROR: %s %v\n", format, args)
 	if w.logger == nil {
 		return
 	}
-	// Handle device.Logger struct
-	if deviceLogger, ok := w.logger.(struct {
-		Verbosef func(format string, args ...interface{})
-		Errorf   func(format string, args ...interface{})
-	}); ok && deviceLogger.Errorf != nil {
-		deviceLogger.Errorf(format, args...)
+
+	// Use reflection to call Errorf
+	val := reflect.ValueOf(w.logger)
+	if val.Kind() == reflect.Ptr {
+		val = val.Elem()
+	}
+
+	errorf := val.FieldByName("Errorf")
+	if errorf.IsValid() && !errorf.IsNil() {
+		errorf.Call([]reflect.Value{
+			reflect.ValueOf(format),
+			reflect.ValueOf(args),
+		})
 	}
 }
 

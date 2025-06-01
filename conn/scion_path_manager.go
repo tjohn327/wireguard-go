@@ -157,7 +157,6 @@ func (pm *PathManager) SelectPath(ia addr.IA) snet.Path {
 }
 
 func (pm *PathManager) refreshAll() {
-	pm.log.Verbosef("Refreshing all paths")
 	pm.mu.RLock()
 	dests := make([]addr.IA, 0, len(pm.cache))
 	for ia := range pm.cache {

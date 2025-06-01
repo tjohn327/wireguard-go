@@ -180,18 +180,23 @@ func (s *ScionNetBind) getUDPConn(localAddr *net.UDPAddr, port uint16) (*net.UDP
 	if err != nil {
 		return nil, fmt.Errorf("failed to get port range: %w", err)
 	}
+	if port != 0 {
+		conn, err := listenConfig().ListenPacket(context.Background(), "udp", localAddr.String())
+		if err != nil {
+			return nil, fmt.Errorf("failed to listen on SCION: %w", err)
+		}
+		return conn.(*net.UDPConn), nil
+	}
 
 	restrictedStart := start
 	if start < 1024 {
 		restrictedStart = 1024
 	}
 	for port := end; port >= restrictedStart; port-- {
-		pconn, err := net.ListenUDP(localAddr.Network(), &net.UDPAddr{
-			IP:   localAddr.IP,
-			Port: int(port),
-		})
+		localAddr.Port = int(port)
+		conn, err := listenConfig().ListenPacket(context.Background(), "udp", localAddr.String())
 		if err == nil {
-			return pconn, nil
+			return conn.(*net.UDPConn), nil
 		}
 		if strings.Contains(err.Error(), "address already in use") {
 			continue
@@ -205,10 +210,6 @@ func (s *ScionNetBind) getUDPConn(localAddr *net.UDPAddr, port uint16) (*net.UDP
 func (s *ScionNetBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	s.logger.Verbosef("Open called with port %d", port)
-	s.logger.Verbosef("scionConn: %v", s.scionConn)
-	s.logger.Verbosef("closed: %v", s.closed)
 
 	if s.scionConn != nil || s.batchConn != nil {
 		return nil, 0, ErrBindAlreadyOpen
@@ -231,13 +232,10 @@ func (s *ScionNetBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 			// Try to use batch connection on Linux/Android
 			var udpConn *net.UDPConn
 			var err error
-			if port == 0 {
-				udpConn, err = s.getUDPConn(s.localAddr, port)
-			} else {
-				udpConn, err = net.ListenUDP("udp", s.localAddr)
-			}
+			udpConn, err = s.getUDPConn(s.localAddr, port)
 			if err != nil {
 				s.logger.Errorf("Failed to create UDP conn for batch: %v", err)
+				s.logger.Verbosef("Falling back to regular SCION connection")
 				s.useBatch = false
 			} else {
 				s.batchConn = NewScionBatchConn(
