@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/scionproto/scion/pkg/addr"
@@ -18,43 +19,62 @@ const (
 	DefaultSCIONDaemonAddr = "127.0.0.1:30255"
 )
 
+func GetScionAddress() string {
+	cmd := exec.Command("scion", "address")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
 // LoadScionConfigFromEnv loads SCION configuration from environment variables
 func LoadScionConfigFromEnv() (*ScionConfig, error) {
 	config := &ScionConfig{
-		DaemonAddr:   DefaultSCIONDaemonAddr,
-		PathPolicy:   PathPolicyShortest,
+		DaemonAddr: DefaultSCIONDaemonAddr,
+		PathPolicy: PathPolicyShortest,
 	}
 
-	// SCION daemon address
-	if addr := os.Getenv("SCION_DAEMON_ADDRESS"); addr != "" {
+	// Load daemon address from environment
+	if addr := os.Getenv(EnvSCIONDaemonAddr); addr != "" {
 		config.DaemonAddr = addr
 	}
 
-	// Local IA (ISD-AS)
-	if iaStr := os.Getenv("SCION_LOCAL_IA"); iaStr != "" {
-		parts := strings.Split(iaStr, ",")
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("invalid SCION_LOCAL_IA format %q: expected ISD-AS", iaStr)
-		}
-		ia, err := addr.ParseIA(parts[0])
-		if err != nil {
-			return nil, fmt.Errorf("invalid SCION_LOCAL_IA %q: %w", iaStr, err)
-		}
-		local_IP := net.ParseIP(parts[1])
-		if local_IP == nil {
-			return nil, fmt.Errorf("invalid SCION_LOCAL_IA %q: %w", iaStr, err)
-		}
-		config.LocalIP = local_IP
-		config.LocalIA = ia
-	} else {
-		return nil, fmt.Errorf("SCION_LOCAL_IA environment variable is required")
-	}
-
-	// Path policy
-	if policy := os.Getenv("SCION_PATH_POLICY"); policy != "" {
+	// Load path policy from environment
+	if policy := os.Getenv(EnvSCIONPathPolicy); policy != "" {
 		config.PathPolicy = ParsePathPolicy(policy)
 	}
+	
+	// Try to get SCION address from scion command first, then fallback to environment
+	scionAddress := GetScionAddress()
+	if scionAddress == "" {
+		scionAddress = os.Getenv(EnvSCIONLocalIA)
+	}
 
+	if scionAddress == "" {
+		return nil, fmt.Errorf("SCION configuration not found: neither scion command nor %s environment variable available", EnvSCIONLocalIA)
+	}
+
+	// Parse SCION address into IA and IP
+	parts := strings.Split(scionAddress, ",")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid SCION address format %q: expected ISD-AS,IP", scionAddress)
+	}
+
+	// Parse ISD-AS
+	ia, err := addr.ParseIA(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("invalid ISD-AS in SCION address %q: %w", scionAddress, err)
+	}
+
+	// Parse IP address
+	localIP := net.ParseIP(parts[1])
+	if localIP == nil {
+		return nil, fmt.Errorf("invalid IP address in SCION address %q", scionAddress)
+	}
+
+	config.LocalIP = localIP
+	config.LocalIA = ia
 	return config, nil
 }
 
@@ -80,8 +100,8 @@ func (c *ScionConfig) String() string {
 // DefaultScionConfig returns a default SCION configuration
 func DefaultScionConfig() *ScionConfig {
 	return &ScionConfig{
-		DaemonAddr:   DefaultSCIONDaemonAddr,
-		PathPolicy:   PathPolicyFirst,
+		DaemonAddr: DefaultSCIONDaemonAddr,
+		PathPolicy: PathPolicyFirst,
 	}
 }
 
@@ -97,10 +117,10 @@ func FormatIA(ia addr.IA) string {
 
 // Environment variable names for SCION configuration
 const (
-	EnvSCIONDaemonAddr   = "SCION_DAEMON_ADDRESS"
-	EnvSCIONLocalIA      = "SCION_LOCAL_IA"
-	EnvSCIONTopology     = "SCION_TOPOLOGY_FILE"
-	EnvSCIONPathPolicy   = "SCION_PATH_POLICY"
+	EnvSCIONDaemonAddr = "SCION_DAEMON_ADDRESS"
+	EnvSCIONLocalIA    = "SCION_LOCAL_IA"
+	EnvSCIONTopology   = "SCION_TOPOLOGY_FILE"
+	EnvSCIONPathPolicy = "SCION_PATH_POLICY"
 )
 
 // GetConfigSummary returns a summary of current SCION configuration

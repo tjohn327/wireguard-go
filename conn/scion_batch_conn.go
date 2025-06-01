@@ -1,8 +1,3 @@
-/* SPDX-License-Identifier: MIT
- *
- * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
- */
-
 package conn
 
 import (
@@ -68,9 +63,11 @@ func NewScionBatchConn(
 		},
 		scionPktPool: sync.Pool{
 			New: func() any {
-				return &snet.Packet{
-					Bytes: make(snet.Bytes, common.SupportedMTU),
+				scionPkts := make([]snet.Packet, IdealBatchSize)
+				for i := range scionPkts {
+					scionPkts[i].Bytes = make(snet.Bytes, common.SupportedMTU)
 				}
+				return &scionPkts
 			},
 		},
 	}
@@ -146,6 +143,12 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 		return 0, err
 	}
 
+	// Get a single SCION packet object to reuse
+	scionPkts := s.scionPktPool.Get().(*[]snet.Packet)
+	defer s.scionPktPool.Put(scionPkts)
+
+	pkt := (*scionPkts)[0]
+
 	// Process each message
 	validMsgs := 0
 	for i := 0; i < numMsgs; i++ {
@@ -155,9 +158,6 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 		}
 
 		// Parse SCION packet
-		pkt := s.scionPktPool.Get().(*snet.Packet)
-		defer s.scionPktPool.Put(pkt)
-
 		pkt.Bytes = msg.Buffers[0][:msg.N]
 		if err := pkt.Decode(); err != nil {
 			s.logger.Verbosef("Failed to decode SCION packet: %v", err)
@@ -167,7 +167,7 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 		// Handle SCMP
 		if _, ok := pkt.Payload.(snet.SCMPPayload); ok {
 			if s.scmpHandler != nil {
-				if err := s.scmpHandler.Handle(pkt); err != nil {
+				if err := s.scmpHandler.Handle(&pkt); err != nil {
 					s.logger.Verbosef("SCMP handler error: %v", err)
 				}
 			}
@@ -226,46 +226,48 @@ func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
 	msgs := s.msgsPool.Get().(*[]ipv6.Message)
 	defer s.msgsPool.Put(msgs)
 
+	scionPkts := s.scionPktPool.Get().(*[]snet.Packet)
+	defer s.scionPktPool.Put(scionPkts)
+
 	scionEp, ok := endpoint.(*ScionNetEndpoint)
 	if !ok {
 		return fmt.Errorf("invalid endpoint type")
 	}
+	destination := snet.SCIONAddress{
+		IA:   scionEp.scionAddr.IA,
+		Host: addr.HostIP(netip.MustParseAddr(scionEp.scionAddr.Host.IP.String())),
+	}
+	source := snet.SCIONAddress{
+		IA:   s.localIA,
+		Host: addr.HostIP(netip.MustParseAddr(s.localAddr.IP.String())),
+	}
+	// path := scionEp.scionAddr.Path
+	if p := s.pathManager.SelectPath(scionEp.scionAddr.IA); p != nil {
+		scionEp.scionAddr.Path = p.Dataplane()
+		scionEp.scionAddr.NextHop = p.UnderlayNextHop()
+	}
+	path := scionEp.scionAddr.Path
+	srcPort := uint16(s.localAddr.Port)
+	dstPort := uint16(scionEp.scionAddr.Host.Port)
 
 	// Prepare SCION packets
 	for i, buf := range bufs {
-
-		// Get buffer for serialized packet
 		pktBuf := *(s.bufferPool.Get().(*[]byte))
 		defer s.bufferPool.Put(&pktBuf)
 
-		// Create SCION packet
-		pkt := &snet.Packet{
-			Bytes: snet.Bytes(pktBuf),
-			PacketInfo: snet.PacketInfo{
-				Destination: snet.SCIONAddress{
-					IA:   scionEp.scionAddr.IA,
-					Host: addr.HostIP(netip.MustParseAddr(scionEp.scionAddr.Host.IP.String())),
-				},
-				Source: snet.SCIONAddress{
-					IA:   s.localIA,
-					Host: addr.HostIP(netip.MustParseAddr(s.localAddr.IP.String())),
-				},
-				Path: scionEp.scionAddr.Path,
-				Payload: snet.UDPPayload{
-					SrcPort: uint16(s.localAddr.Port),
-					DstPort: uint16(scionEp.scionAddr.Host.Port),
-					Payload: buf,
-				},
-			},
+		(*scionPkts)[i].Bytes = snet.Bytes(pktBuf)
+		(*scionPkts)[i].PacketInfo.Destination = destination
+		(*scionPkts)[i].PacketInfo.Source = source
+		(*scionPkts)[i].PacketInfo.Path = path
+		(*scionPkts)[i].PacketInfo.Payload = snet.UDPPayload{
+			SrcPort: srcPort,
+			DstPort: dstPort,
+			Payload: buf,
 		}
-
-		// Serialize packet
-		if err := pkt.Serialize(); err != nil {
+		if err := (*scionPkts)[i].Serialize(); err != nil {
 			return fmt.Errorf("failed to serialize SCION packet: %w", err)
 		}
-
-		// Setup message
-		(*msgs)[i].Buffers[0] = pkt.Bytes
+		(*msgs)[i].Buffers[0] = (*scionPkts)[i].Bytes
 		(*msgs)[i].Addr = scionEp.scionAddr.NextHop
 		setSrcControl(&(*msgs)[i].OOB, &StdNetEndpoint{
 			AddrPort: scionEp.scionAddr.NextHop.AddrPort(),

@@ -77,7 +77,6 @@ func NewPathManager(d daemon.Connector, localIA addr.IA, pol PathPolicy, log Log
 		opt(pm)
 	}
 	pm.ctx, pm.cancel = context.WithCancel(context.Background())
-	pm.Start()
 	return pm
 }
 

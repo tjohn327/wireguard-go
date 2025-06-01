@@ -1,8 +1,3 @@
-/* SPDX-License-Identifier: MIT
- *
- * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
- */
-
 package conn
 
 import (
@@ -326,11 +321,6 @@ func (s *ScionNetBind) Close() error {
 
 	var err1, err2, err3, err4 error
 
-	if s.pathManager != nil {
-		s.pathManager.Close()
-		s.pathManager = nil
-	}
-
 	if s.batchConn != nil {
 		err1 = s.batchConn.Close()
 		s.batchConn = nil
@@ -344,6 +334,11 @@ func (s *ScionNetBind) Close() error {
 	if s.daemonConn != nil {
 		err3 = s.daemonConn.Close()
 		s.daemonConn = nil
+	}
+
+	if s.pathManager != nil {
+		s.pathManager.Close()
+		s.pathManager = nil
 	}
 
 	// Return first non-nil error

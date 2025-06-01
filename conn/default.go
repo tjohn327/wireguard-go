@@ -8,8 +8,7 @@
 package conn
 
 import (
-	"fmt"
-	"os"
+	"log"
 )
 
 func NewDefaultBind() Bind {
@@ -23,19 +22,17 @@ func NewDefaultBindWithLogger(logger any) Bind {
 		// Handle the device.Logger struct type
 		scionLogger = &LoggerWrapper{logger}
 	}
-	// Check if SCION is configured via environment variables
-	if os.Getenv("SCION_LOCAL_IA") != "" {
-		config, err := LoadScionConfigFromEnv()
-		if err == nil && config != nil {
-			if scionLogger != nil {
-				scionLogger.Verbosef("Using SCION bind: %s", config.String())
-			}
-			return NewScionNetBind(config, scionLogger)
-		}
+	// Check if SCION is present
+	config, err := LoadScionConfigFromEnv()
+	if err == nil && config != nil {
 		if scionLogger != nil {
-			scionLogger.Errorf("Failed to load SCION config: %v, falling back to standard bind", err)
+			scionLogger.Verbosef("Using SCION bind: %s", config.String())
 		}
-	} 
+		return NewScionNetBind(config, scionLogger)
+	}
+	if scionLogger != nil {
+		scionLogger.Errorf("Failed to load SCION config: %v, falling back to standard bind", err)
+	}
 
 	// Fallback to standard bind
 	if scionLogger != nil {
@@ -50,7 +47,7 @@ type LoggerWrapper struct {
 }
 
 func (w *LoggerWrapper) Verbosef(format string, args ...interface{}) {
-	fmt.Printf("Verbosef: %s %v\n", format, args)
+	log.Printf("DEBUG: %s %v\n", format, args)
 	if w.logger == nil {
 		return
 	}
@@ -58,13 +55,13 @@ func (w *LoggerWrapper) Verbosef(format string, args ...interface{}) {
 	if deviceLogger, ok := w.logger.(struct {
 		Verbosef func(format string, args ...interface{})
 		Errorf   func(format string, args ...interface{})
-	}); ok && deviceLogger.Verbosef != nil {
+	}); ok && deviceLogger.Errorf != nil {
 		deviceLogger.Verbosef(format, args...)
 	}
 }
 
 func (w *LoggerWrapper) Errorf(format string, args ...interface{}) {
-	fmt.Printf("Errorf: %s %v\n", format, args)
+	log.Printf("ERROR: %s %v\n", format, args)
 	if w.logger == nil {
 		return
 	}
