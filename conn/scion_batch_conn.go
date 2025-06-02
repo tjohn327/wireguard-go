@@ -6,7 +6,6 @@ import (
 	"net/netip"
 	"runtime"
 	"sync"
-	"time"
 
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/private/common"
@@ -33,7 +32,8 @@ type ScionBatchConn struct {
 	msgsPool   sync.Pool
 
 	// SCION packet pools
-	scionPktPool sync.Pool
+	scionPktPool  sync.Pool
+	singlePktPool sync.Pool
 
 	// Capabilities
 	supportsBatch bool
@@ -71,6 +71,13 @@ func NewScionBatchConn(
 				return &scionPkts
 			},
 		},
+		singlePktPool: sync.Pool{
+			New: func() any {
+				return &snet.Packet{
+					Bytes: make(snet.Bytes, common.SupportedMTU),
+				}
+			},
+		},
 	}
 
 	// Enable batch operations on Linux/Android
@@ -100,6 +107,32 @@ func NewScionBatchConn(
 	return sbc
 }
 
+func (s *ScionBatchConn) getMessages() *[]ipv6.Message {
+	return s.msgsPool.Get().(*[]ipv6.Message)
+}
+
+func (s *ScionBatchConn) putMessages(msgs *[]ipv6.Message) {
+	for i := range *msgs {
+		(*msgs)[i].OOB = (*msgs)[i].OOB[:0]
+		(*msgs)[i] = ipv6.Message{Buffers: (*msgs)[i].Buffers, OOB: (*msgs)[i].OOB}
+	}
+	s.msgsPool.Put(msgs)
+}
+
+func (s *ScionBatchConn) getScionPkts() *[]snet.Packet {
+	return s.scionPktPool.Get().(*[]snet.Packet)
+}
+
+func (s *ScionBatchConn) putScionPkts(pkts *[]snet.Packet) {
+	for i := range *pkts {
+		// Reset packet state but keep allocated buffers
+		(*pkts)[i] = snet.Packet{
+			Bytes: (*pkts)[i].Bytes,
+		}
+	}
+	s.scionPktPool.Put(pkts)
+}
+
 func (s *ScionBatchConn) SetSCMPHandler(handler snet.SCMPHandler) {
 	s.scmpHandler = handler
 }
@@ -118,27 +151,13 @@ func (s *ScionBatchConn) BatchSize() int {
 
 // ReadBatch reads multiple SCION packets in a single syscall
 func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (int, error) {
-	if monitorPerf {
-		start := time.Now()
-		defer func() {
-			elapsed := time.Since(start)
-			monitorPerfCountRead++
-
-			monitorPerfTotalReadTime += elapsed
-			if monitorPerfCountRead%100 == 0 {
-				s.logger.Verbosef("ReadBatch took %v", monitorPerfTotalReadTime/time.Duration(monitorPerfCountRead), monitorPerfTotalRead)
-				monitorPerfTotalRead = 0
-				monitorPerfTotalReadTime = 0
-			}
-		}()
-	}
 	if !s.supportsBatch || s.ipv4PC == nil && s.ipv6PC == nil {
 		// Fallback to single packet read
 		return s.readSingle(bufs[0], sizes, eps)
 	}
 
-	msgs := s.msgsPool.Get().(*[]ipv6.Message)
-	defer s.msgsPool.Put(msgs)
+	msgs := s.getMessages()
+	defer s.putMessages(msgs)
 
 	// Setup message buffers
 	for i := range bufs {
@@ -158,13 +177,11 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 		return 0, err
 	}
 
-	monitorPerfTotalRead += numMsgs * len(bufs)
-
 	// Get a single SCION packet object to reuse
-	scionPkts := s.scionPktPool.Get().(*[]snet.Packet)
-	defer s.scionPktPool.Put(scionPkts)
+	scionPkt := s.singlePktPool.Get().(*snet.Packet)
+	defer s.singlePktPool.Put(scionPkt)
 
-	pkt := (*scionPkts)[0]
+	pkt := scionPkt
 
 	// Process each message
 	validMsgs := 0
@@ -184,7 +201,7 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 		// Handle SCMP
 		if _, ok := pkt.Payload.(snet.SCMPPayload); ok {
 			if s.scmpHandler != nil {
-				if err := s.scmpHandler.Handle(&pkt); err != nil {
+				if err := s.scmpHandler.Handle(pkt); err != nil {
 					s.logger.Verbosef("SCMP handler error: %v", err)
 				}
 			}
@@ -228,30 +245,8 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 	return validMsgs, nil
 }
 
-var monitorPerf = true
-var monitorPerfCountRead = 0
-var monitorPerfCountWrite = 0
-var monitorPerfTotalRead = 0
-var monitorPerfTotalWrite = 0
-var monitorPerfTotalReadTime time.Duration
-var monitorPerfTotalWriteTime time.Duration
-
 // WriteBatch sends multiple SCION packets in a single syscall
 func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
-	if monitorPerf {
-		start := time.Now()
-		defer func() {
-			elapsed := time.Since(start)
-			monitorPerfCountWrite++
-			monitorPerfTotalWrite += len(bufs)
-			monitorPerfTotalWriteTime += elapsed
-			if monitorPerfCountWrite%100 == 0 {
-				s.logger.Verbosef("WriteBatch took %v", monitorPerfTotalWriteTime/time.Duration(monitorPerfCountWrite), monitorPerfTotalWrite)
-				monitorPerfTotalWrite = 0
-				monitorPerfTotalWriteTime = 0
-			}
-		}()
-	}
 	if !s.supportsBatch || s.ipv4PC == nil && s.ipv6PC == nil {
 		// Fallback to single packet writes
 		for _, buf := range bufs {
@@ -262,11 +257,11 @@ func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
 		return nil
 	}
 
-	msgs := s.msgsPool.Get().(*[]ipv6.Message)
-	defer s.msgsPool.Put(msgs)
+	msgs := s.getMessages()
+	defer s.putMessages(msgs)
 
-	scionPkts := s.scionPktPool.Get().(*[]snet.Packet)
-	defer s.scionPktPool.Put(scionPkts)
+	scionPkts := s.getScionPkts()
+	defer s.putScionPkts(scionPkts)
 
 	scionEp, ok := endpoint.(*ScionNetEndpoint)
 	if !ok {
@@ -280,21 +275,13 @@ func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
 		IA:   s.localIA,
 		Host: addr.HostIP(netip.MustParseAddr(s.localAddr.IP.String())),
 	}
-	// path := scionEp.scionAddr.Path
-	// if p := s.pathManager.SelectPath(scionEp.scionAddr.IA); p != nil {
-	// 	scionEp.scionAddr.Path = p.Dataplane()
-	// 	scionEp.scionAddr.NextHop = p.UnderlayNextHop()
-	// }
+
 	path := scionEp.scionAddr.Path
 	srcPort := uint16(s.localAddr.Port)
 	dstPort := uint16(scionEp.scionAddr.Host.Port)
 
 	// Prepare SCION packets
 	for i, buf := range bufs {
-		pktBuf := *(s.bufferPool.Get().(*[]byte))
-		defer s.bufferPool.Put(&pktBuf)
-
-		(*scionPkts)[i].Bytes = snet.Bytes(pktBuf)
 		(*scionPkts)[i].PacketInfo.Destination = destination
 		(*scionPkts)[i].PacketInfo.Source = source
 		(*scionPkts)[i].PacketInfo.Path = path
@@ -326,8 +313,8 @@ func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
 
 // readSingle reads a single SCION packet (fallback for non-batch systems)
 func (s *ScionBatchConn) readSingle(buf []byte, sizes []int, eps []Endpoint) (int, error) {
-	pkt := s.scionPktPool.Get().(*snet.Packet)
-	defer s.scionPktPool.Put(pkt)
+	pkt := s.singlePktPool.Get().(*snet.Packet)
+	defer s.singlePktPool.Put(pkt)
 
 	pkt.Bytes = snet.Bytes(buf)
 	n, remoteAddr, err := s.conn.ReadFrom(buf)

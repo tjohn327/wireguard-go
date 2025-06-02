@@ -103,6 +103,7 @@ type Logger interface {
 // ScionNetEndpoint represents a SCION endpoint
 type ScionNetEndpoint struct {
 	scionAddr *snet.UDPAddr
+	src       []byte
 }
 
 var (
