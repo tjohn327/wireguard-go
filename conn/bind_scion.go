@@ -102,8 +102,8 @@ type Logger interface {
 
 // ScionNetEndpoint represents a SCION endpoint
 type ScionNetEndpoint struct {
+	StdNetEndpoint
 	scionAddr *snet.UDPAddr
-	src       []byte
 }
 
 var (
@@ -181,8 +181,14 @@ func (s *ScionNetBind) getUDPConn(localAddr *net.UDPAddr, port uint16) (*net.UDP
 	if err != nil {
 		return nil, fmt.Errorf("failed to get port range: %w", err)
 	}
+
+	network := "udp4"
+	if localAddr.IP.To4() == nil {
+		network = "udp6"
+	}
+
 	if port != 0 {
-		conn, err := listenConfig().ListenPacket(context.Background(), "udp", localAddr.String())
+		conn, err := listenConfig().ListenPacket(context.Background(), network, localAddr.String())
 		if err != nil {
 			return nil, fmt.Errorf("failed to listen on SCION: %w", err)
 		}
@@ -195,7 +201,7 @@ func (s *ScionNetBind) getUDPConn(localAddr *net.UDPAddr, port uint16) (*net.UDP
 	}
 	for port := end; port >= restrictedStart; port-- {
 		localAddr.Port = int(port)
-		conn, err := listenConfig().ListenPacket(context.Background(), "udp", localAddr.String())
+		conn, err := listenConfig().ListenPacket(context.Background(), network, localAddr.String())
 		if err == nil {
 			return conn.(*net.UDPConn), nil
 		}
@@ -300,9 +306,14 @@ func (s *ScionNetBind) makeReceiveSCION() ReceiveFunc {
 		sizes[0] = readBytes
 		// Convert net.Addr to our endpoint type
 		if scionAddr, ok := remote.(*snet.UDPAddr); ok {
+			addrPort := netip.AddrPortFrom(netip.MustParseAddr(scionAddr.NextHop.IP.String()), uint16(scionAddr.NextHop.Port))
 			eps[0] = &ScionNetEndpoint{
+				StdNetEndpoint: StdNetEndpoint{
+					AddrPort: addrPort,
+				},
 				scionAddr: scionAddr,
 			}
+			eps[0].DstIP()
 		} else {
 			// Fallback if it's not a SCION address
 			return 0, fmt.Errorf("unexpected address type: %T", remote)
@@ -400,6 +411,8 @@ func (s *ScionNetBind) ParseEndpoint(str string) (Endpoint, error) {
 			if p := s.pathManager.SelectPath(scionAddr.IA); p != nil {
 				scionAddr.Path = p.Dataplane()
 				scionAddr.NextHop = p.UnderlayNextHop()
+				scionEndpoint.StdNetEndpoint.AddrPort = netip.AddrPortFrom(
+					netip.MustParseAddr(scionAddr.NextHop.IP.String()), uint16(scionAddr.NextHop.Port))
 			}
 			return scionEndpoint, nil
 		}
@@ -420,54 +433,6 @@ func (s *ScionNetBind) SetPathPolicy(policy PathPolicy) {
 	s.pathMu.Lock()
 	defer s.pathMu.Unlock()
 	s.pathPolicy = policy
-}
-
-// ScionNetEndpoint implementations
-func (e *ScionNetEndpoint) ClearSrc() {
-}
-
-func (e *ScionNetEndpoint) SrcToString() string {
-	if e.scionAddr != nil {
-		return "" // SCION doesn't expose source the same way
-	}
-	return ""
-}
-
-func (e *ScionNetEndpoint) DstToString() string {
-	if e.scionAddr != nil {
-		return e.scionAddr.String()
-	}
-	return ""
-}
-
-func (e *ScionNetEndpoint) DstToBytes() []byte {
-	if e.scionAddr != nil {
-		return []byte(e.scionAddr.String())
-	}
-	return nil
-}
-
-func (e *ScionNetEndpoint) DstIP() netip.Addr {
-	if e.scionAddr != nil {
-		if e.scionAddr.Host != nil {
-			addr, _ := netip.AddrFromSlice(e.scionAddr.Host.IP)
-			return addr
-		}
-	}
-	return netip.Addr{}
-}
-
-func (e *ScionNetEndpoint) SrcIP() netip.Addr {
-	return netip.Addr{}
-}
-
-func (e *ScionNetEndpoint) Port() uint16 {
-	if e.scionAddr != nil {
-		if e.scionAddr.Host != nil {
-			return uint16(e.scionAddr.Host.Port)
-		}
-	}
-	return 0
 }
 
 func (e *ScionNetEndpoint) GetScionAddr() *snet.UDPAddr {

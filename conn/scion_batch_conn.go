@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"runtime"
 	"sync"
 
 	"github.com/scionproto/scion/pkg/addr"
@@ -16,6 +15,7 @@ import (
 
 // ScionBatchConn provides batch send/receive capabilities for SCION packets
 type ScionBatchConn struct {
+	mu          sync.Mutex
 	conn        *net.UDPConn
 	ipv4PC      *ipv4.PacketConn
 	ipv6PC      *ipv6.PacketConn
@@ -27,17 +27,22 @@ type ScionBatchConn struct {
 	replyPather snet.ReplyPather
 	logger      Logger
 
-	// Buffer pools
-	bufferPool sync.Pool
+	// Offloads
+	ipv4TxOffload bool
+	ipv4RxOffload bool
+	ipv6TxOffload bool
+	ipv6RxOffload bool
+
 	msgsPool   sync.Pool
 
 	// SCION packet pools
 	scionPktPool  sync.Pool
 	singlePktPool sync.Pool
 
+	udpAddrPool sync.Pool
+
 	// Capabilities
-	supportsBatch bool
-	batchSize     int
+	batchSize int
 }
 
 func NewScionBatchConn(
@@ -56,12 +61,7 @@ func NewScionBatchConn(
 		logger:      logger,
 		replyPather: snet.DefaultReplyPather{},
 		batchSize:   1,
-		bufferPool: sync.Pool{
-			New: func() any {
-				buf := make([]byte, common.SupportedMTU)
-				return &buf
-			},
-		},
+		
 		scionPktPool: sync.Pool{
 			New: func() any {
 				scionPkts := make([]snet.Packet, IdealBatchSize)
@@ -78,30 +78,40 @@ func NewScionBatchConn(
 				}
 			},
 		},
+		udpAddrPool: sync.Pool{
+			New: func() any {
+				return &net.UDPAddr{
+					IP: make([]byte, 16),
+				}
+			},
+		},
 	}
 
 	// Enable batch operations on Linux/Android
-	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
-		if conn.LocalAddr().(*net.UDPAddr).IP.To4() != nil {
-			sbc.ipv4PC = ipv4.NewPacketConn(conn)
-			sbc.supportsBatch = true
-			sbc.batchSize = IdealBatchSize
-		} else {
-			sbc.ipv6PC = ipv6.NewPacketConn(conn)
-			sbc.supportsBatch = true
-			sbc.batchSize = IdealBatchSize
-		}
+	if conn.LocalAddr().(*net.UDPAddr).IP.To4() != nil {
+		sbc.ipv4PC = ipv4.NewPacketConn(conn)
+		sbc.ipv4TxOffload, sbc.ipv4RxOffload = supportsUDPOffload(conn)
+		sbc.batchSize = IdealBatchSize
+	} else {
+		sbc.ipv6PC = ipv6.NewPacketConn(conn)
+		sbc.ipv6TxOffload, sbc.ipv6RxOffload = supportsUDPOffload(conn)
+		sbc.batchSize = IdealBatchSize
+	}
 
-		sbc.msgsPool = sync.Pool{
-			New: func() any {
-				msgs := make([]ipv6.Message, IdealBatchSize)
-				for i := range msgs {
-					msgs[i].Buffers = make(net.Buffers, 1)
-					msgs[i].OOB = make([]byte, 0, stickyControlSize+gsoControlSize)
-				}
-				return &msgs
-			},
-		}
+	// sbc.ipv6TxOffload = false
+	sbc.ipv6RxOffload = false
+	// sbc.ipv4TxOffload = false
+	sbc.ipv4RxOffload = false
+
+	sbc.msgsPool = sync.Pool{
+		New: func() any {
+			msgs := make([]ipv6.Message, IdealBatchSize)
+			for i := range msgs {
+				msgs[i].Buffers = make(net.Buffers, 1)
+				msgs[i].OOB = make([]byte, 0, stickyControlSize+gsoControlSize)
+			}
+			return &msgs
+		},
 	}
 
 	return sbc
@@ -142,7 +152,22 @@ func (s *ScionBatchConn) LocalAddr() net.Addr {
 }
 
 func (s *ScionBatchConn) Close() error {
-	return s.conn.Close()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var err error
+
+	if s.conn != nil {
+		err = s.conn.Close()
+		s.conn = nil
+		s.ipv4PC = nil
+		s.ipv6PC = nil
+	}
+	s.ipv4TxOffload = false
+	s.ipv4RxOffload = false
+	s.ipv6TxOffload = false
+	s.ipv6RxOffload = false
+	return err
 }
 
 func (s *ScionBatchConn) BatchSize() int {
@@ -151,27 +176,52 @@ func (s *ScionBatchConn) BatchSize() int {
 
 // ReadBatch reads multiple SCION packets in a single syscall
 func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (int, error) {
-	if !s.supportsBatch || s.ipv4PC == nil && s.ipv6PC == nil {
+	if s.ipv4PC == nil && s.ipv6PC == nil {
 		// Fallback to single packet read
 		return s.readSingle(bufs[0], sizes, eps)
 	}
 
 	msgs := s.getMessages()
-	defer s.putMessages(msgs)
-
-	// Setup message buffers
 	for i := range bufs {
 		(*msgs)[i].Buffers[0] = bufs[i]
 		(*msgs)[i].OOB = (*msgs)[i].OOB[:cap((*msgs)[i].OOB)]
 	}
+	defer s.putMessages(msgs)
+
+	// sbufs := s.getBuffers()
+	// defer s.putBuffers(sbufs)
 
 	// Read batch
 	var numMsgs int
 	var err error
 	if s.ipv4PC != nil {
-		numMsgs, err = s.ipv4PC.ReadBatch((*msgs)[:len(bufs)], 0)
+		if s.ipv4RxOffload {
+			readAt := len(*msgs) - (IdealBatchSize / udpSegmentMaxDatagrams)
+			numMsgs, err = s.ipv4PC.ReadBatch((*msgs)[readAt:], 0)
+			if err != nil {
+				return 0, err
+			}
+			numMsgs, err = splitCoalescedMessages(*msgs, readAt, getGSOSize)
+			if err != nil {
+				return 0, err
+			}
+		} else {
+			numMsgs, err = s.ipv4PC.ReadBatch((*msgs), 0)
+		}
 	} else {
-		numMsgs, err = s.ipv6PC.ReadBatch((*msgs)[:len(bufs)], 0)
+		if s.ipv6RxOffload {
+			readAt := len(*msgs) - (IdealBatchSize / udpSegmentMaxDatagrams)
+			_, err = s.ipv6PC.ReadBatch((*msgs)[readAt:], 0)
+			if err != nil {
+				return 0, err
+			}
+			numMsgs, err = splitCoalescedMessages(*msgs, readAt, getGSOSize)
+			if err != nil {
+				return 0, err
+			}
+		} else {
+			numMsgs, err = s.ipv6PC.ReadBatch((*msgs), 0)
+		}
 	}
 	if err != nil {
 		return 0, err
@@ -184,9 +234,9 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 	pkt := scionPkt
 
 	// Process each message
-	validMsgs := 0
 	for i := 0; i < numMsgs; i++ {
 		msg := &(*msgs)[i]
+		sizes[i] = msg.N
 		if msg.N == 0 {
 			continue
 		}
@@ -236,18 +286,28 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 			NextHop: msg.Addr.(*net.UDPAddr),
 		}
 
-		eps[validMsgs] = &ScionNetEndpoint{scionAddr: scionAddr}
-		sizes[validMsgs] = len(udp.Payload)
-		copy(bufs[validMsgs], udp.Payload)
-		validMsgs++
+		eps[i] = &ScionNetEndpoint{
+			StdNetEndpoint: StdNetEndpoint{
+				AddrPort: netip.AddrPortFrom(
+					netip.MustParseAddr(
+						scionAddr.NextHop.IP.String()),
+					uint16(scionAddr.NextHop.Port)),
+			},
+			scionAddr: scionAddr,
+		}
+		if scionEp, ok := eps[i].(*ScionNetEndpoint); ok {
+			getSrcFromControl(msg.OOB[:msg.NN], &scionEp.StdNetEndpoint)
+		}
+		sizes[i] = len(udp.Payload)
+		copy(bufs[i], udp.Payload)
 	}
 
-	return validMsgs, nil
+	return numMsgs, nil
 }
 
 // WriteBatch sends multiple SCION packets in a single syscall
 func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
-	if !s.supportsBatch || s.ipv4PC == nil && s.ipv6PC == nil {
+	if s.ipv4PC == nil && s.ipv6PC == nil {
 		// Fallback to single packet writes
 		for _, buf := range bufs {
 			if err := s.writeSingle(buf, endpoint); err != nil {
@@ -280,6 +340,21 @@ func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
 	srcPort := uint16(s.localAddr.Port)
 	dstPort := uint16(scionEp.scionAddr.Host.Port)
 
+	ua := s.udpAddrPool.Get().(*net.UDPAddr)
+	defer s.udpAddrPool.Put(ua)
+	if s.ipv4PC != nil {
+		as4 := scionEp.StdNetEndpoint.DstIP().As4()
+		copy(ua.IP, as4[:])
+		ua.IP = ua.IP[:4]
+	} else {
+		as16 := scionEp.StdNetEndpoint.DstIP().As16()
+		copy(ua.IP, as16[:])
+		ua.IP = ua.IP[:16]
+	}
+	ua.Port = int(scionEp.StdNetEndpoint.Port())
+
+	sbufs := make([][]byte, len(bufs))
+
 	// Prepare SCION packets
 	for i, buf := range bufs {
 		(*scionPkts)[i].PacketInfo.Destination = destination
@@ -293,21 +368,78 @@ func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
 		if err := (*scionPkts)[i].Serialize(); err != nil {
 			return fmt.Errorf("failed to serialize SCION packet: %w", err)
 		}
-		(*msgs)[i].Buffers[0] = (*scionPkts)[i].Bytes
-		(*msgs)[i].Addr = scionEp.scionAddr.NextHop
-		setSrcControl(&(*msgs)[i].OOB, &StdNetEndpoint{
-			AddrPort: scionEp.scionAddr.NextHop.AddrPort(),
-		})
+		sbufs[i] = (*scionPkts)[i].Bytes
 	}
 
 	// Send batch
 	var err error
+retry:
 	if s.ipv4PC != nil {
-		_, err = s.ipv4PC.WriteBatch((*msgs)[:len(bufs)], 0)
+		if s.ipv4TxOffload {
+			n := coalesceMessages(ua, &scionEp.StdNetEndpoint, sbufs, *msgs, setGSOSize)
+			err = s.sendv4(s.ipv4PC, (*msgs)[:n])
+			if err != nil && errShouldDisableUDPGSO(err) {
+				s.ipv4TxOffload = false
+				goto retry
+			}
+		} else {
+			for i := range bufs {
+				(*msgs)[i].Buffers[0] = sbufs[i]
+				(*msgs)[i].Addr = ua
+				setSrcControl(&(*msgs)[i].OOB, &scionEp.StdNetEndpoint)
+			}
+			err = s.sendv4(s.ipv4PC, (*msgs)[:len(bufs)])
+		}
 	} else {
-		_, err = s.ipv6PC.WriteBatch((*msgs)[:len(bufs)], 0)
+		if s.ipv6TxOffload {
+			n := coalesceMessages(ua, &scionEp.StdNetEndpoint, sbufs, *msgs, setGSOSize)
+			err = s.sendv6(s.ipv6PC, (*msgs)[:n])
+			if err != nil && errShouldDisableUDPGSO(err) {
+				s.ipv6TxOffload = false
+				goto retry
+			}
+		} else {
+			for i := range bufs {
+				(*msgs)[i].Buffers[0] = sbufs[i]
+				(*msgs)[i].Addr = ua
+				setSrcControl(&(*msgs)[i].OOB, &scionEp.StdNetEndpoint)
+			}
+			err = s.sendv6(s.ipv6PC, (*msgs)[:len(bufs)])
+		}
 	}
 
+	return err
+}
+
+func (s *ScionBatchConn) sendv4(pc *ipv4.PacketConn, msgs []ipv6.Message) error {
+	var (
+		n     int
+		err   error
+		start int
+	)
+	for {
+		n, err = pc.WriteBatch(msgs[start:], 0)
+		if err != nil || n == len(msgs[start:]) {
+			break
+		}
+		start += n
+	}
+	return err
+}
+
+func (s *ScionBatchConn) sendv6(pc *ipv6.PacketConn, msgs []ipv6.Message) error {
+	var (
+		n     int
+		err   error
+		start int
+	)
+	for {
+		n, err = pc.WriteBatch(msgs[start:], 0)
+		if err != nil || n == len(msgs[start:]) {
+			break
+		}
+		start += n
+	}
 	return err
 }
 
@@ -362,7 +494,14 @@ func (s *ScionBatchConn) readSingle(buf []byte, sizes []int, eps []Endpoint) (in
 		NextHop: remoteAddr.(*net.UDPAddr),
 	}
 
-	eps[0] = &ScionNetEndpoint{scionAddr: scionAddr}
+	eps[0] = &ScionNetEndpoint{
+		StdNetEndpoint: StdNetEndpoint{
+			AddrPort: netip.AddrPortFrom(
+				netip.MustParseAddr(scionAddr.NextHop.IP.String()),
+				uint16(scionAddr.NextHop.Port)),
+		},
+		scionAddr: scionAddr,
+	}
 	sizes[0] = len(udp.Payload)
 	copy(buf, udp.Payload)
 
@@ -376,33 +515,30 @@ func (s *ScionBatchConn) writeSingle(buf []byte, ep Endpoint) error {
 		return fmt.Errorf("invalid endpoint type")
 	}
 
-	pktBuf := *(s.bufferPool.Get().(*[]byte))
-	defer s.bufferPool.Put(&pktBuf)
+	scionPkt := s.singlePktPool.Get().(*snet.Packet)
+	defer s.singlePktPool.Put(scionPkt)
 
-	pkt := &snet.Packet{
-		Bytes: snet.Bytes(pktBuf),
-		PacketInfo: snet.PacketInfo{
-			Destination: snet.SCIONAddress{
-				IA:   scionEp.scionAddr.IA,
-				Host: addr.HostIP(netip.MustParseAddr(scionEp.scionAddr.Host.IP.String())),
-			},
-			Source: snet.SCIONAddress{
-				IA:   s.localIA,
-				Host: addr.HostIP(netip.MustParseAddr(s.localAddr.IP.String())),
-			},
-			Path: scionEp.scionAddr.Path,
-			Payload: snet.UDPPayload{
-				SrcPort: uint16(s.localAddr.Port),
-				DstPort: uint16(scionEp.scionAddr.Host.Port),
-				Payload: buf,
-			},
+	scionPkt.PacketInfo = snet.PacketInfo{
+		Destination: snet.SCIONAddress{
+			IA:   scionEp.scionAddr.IA,
+			Host: addr.HostIP(netip.MustParseAddr(scionEp.scionAddr.Host.IP.String())),
+		},
+		Source: snet.SCIONAddress{
+			IA:   s.localIA,
+			Host: addr.HostIP(netip.MustParseAddr(s.localAddr.IP.String())),
+		},
+		Path: scionEp.scionAddr.Path,
+		Payload: snet.UDPPayload{
+			SrcPort: uint16(s.localAddr.Port),
+			DstPort: uint16(scionEp.scionAddr.Host.Port),
+			Payload: buf,
 		},
 	}
 
-	if err := pkt.Serialize(); err != nil {
+	if err := scionPkt.Serialize(); err != nil {
 		return fmt.Errorf("failed to serialize SCION packet: %w", err)
 	}
 
-	_, err := s.conn.WriteTo(pkt.Bytes, scionEp.scionAddr.NextHop)
+	_, err := s.conn.WriteTo(scionPkt.Bytes, scionEp.scionAddr.NextHop)
 	return err
 }
