@@ -371,7 +371,7 @@ func (s *ScionNetBind) Send(bufs [][]byte, ep Endpoint) error {
 		return ErrWrongEndpointType
 	}
 
-	if p := s.pathManager.SelectPath(scionEp.scionAddr.IA); p != nil {
+	if p, err := s.pathManager.GetPath(scionEp.scionAddr.IA); err == nil {
 		scionEp.scionAddr.Path = p.Dataplane()
 		scionEp.scionAddr.NextHop = p.UnderlayNextHop()
 	}
@@ -408,7 +408,7 @@ func (s *ScionNetBind) ParseEndpoint(str string) (Endpoint, error) {
 				scionAddr: scionAddr,
 			}
 			s.pathManager.RegisterEndpoint(scionAddr.IA)
-			if p := s.pathManager.SelectPath(scionAddr.IA); p != nil {
+			if p, err := s.pathManager.GetPath(scionAddr.IA); err == nil {
 				scionAddr.Path = p.Dataplane()
 				scionAddr.NextHop = p.UnderlayNextHop()
 				scionEndpoint.StdNetEndpoint.AddrPort = netip.AddrPortFrom(
@@ -441,4 +441,28 @@ func (e *ScionNetEndpoint) GetScionAddr() *snet.UDPAddr {
 
 func (e *ScionNetEndpoint) SetScionAndIPAddresses(scionAddr *snet.UDPAddr) {
 	e.scionAddr = scionAddr
+}
+
+// GetPathsJSON returns a JSON string containing available paths for the given IA
+func (bind *ScionNetBind) GetPathsJSON(iaStr string) (string, error) {
+	if bind.pathManager == nil {
+		return "", fmt.Errorf("path manager not initialized")
+	}
+	return bind.pathManager.GetPathsJSON(iaStr)
+}
+
+// SetPath sets a specific path for a destination IA
+func (bind *ScionNetBind) SetPath(iaStr string, pathIndex int) error {
+	if bind.pathManager == nil {
+		return fmt.Errorf("path manager not initialized")
+	}
+	return bind.pathManager.SetPath(iaStr, pathIndex)
+}
+
+// GetPathPolicy returns the current path selection policy
+func (bind *ScionNetBind) GetPathPolicy() string {
+	if bind.pathManager == nil {
+		return "unknown"
+	}
+	return bind.pathManager.policy.String()
 }

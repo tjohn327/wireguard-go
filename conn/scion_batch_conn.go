@@ -33,7 +33,7 @@ type ScionBatchConn struct {
 	ipv6TxOffload bool
 	ipv6RxOffload bool
 
-	msgsPool   sync.Pool
+	msgsPool sync.Pool
 
 	// SCION packet pools
 	scionPktPool  sync.Pool
@@ -61,7 +61,7 @@ func NewScionBatchConn(
 		logger:      logger,
 		replyPather: snet.DefaultReplyPather{},
 		batchSize:   1,
-		
+
 		scionPktPool: sync.Pool{
 			New: func() any {
 				scionPkts := make([]snet.Packet, IdealBatchSize)
@@ -197,7 +197,7 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 	if s.ipv4PC != nil {
 		if s.ipv4RxOffload {
 			readAt := len(*msgs) - (IdealBatchSize / udpSegmentMaxDatagrams)
-			numMsgs, err = s.ipv4PC.ReadBatch((*msgs)[readAt:], 0)
+			_, err = s.ipv4PC.ReadBatch((*msgs)[readAt:], 0)
 			if err != nil {
 				return 0, err
 			}
@@ -207,6 +207,9 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 			}
 		} else {
 			numMsgs, err = s.ipv4PC.ReadBatch((*msgs), 0)
+			if err != nil {
+				return 0, err
+			}
 		}
 	} else {
 		if s.ipv6RxOffload {
@@ -221,10 +224,10 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 			}
 		} else {
 			numMsgs, err = s.ipv6PC.ReadBatch((*msgs), 0)
+			if err != nil {
+				return 0, err
+			}
 		}
-	}
-	if err != nil {
-		return 0, err
 	}
 
 	// Get a single SCION packet object to reuse
@@ -365,7 +368,7 @@ func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
 			DstPort: dstPort,
 			Payload: buf,
 		}
-		if err := (*scionPkts)[i].Serialize(); err != nil {
+		if err := Serialize(&(*scionPkts)[i]); err != nil {
 			return fmt.Errorf("failed to serialize SCION packet: %w", err)
 		}
 		sbufs[i] = (*scionPkts)[i].Bytes

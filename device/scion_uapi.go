@@ -8,9 +8,9 @@ package device
 import (
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
-	"github.com/scionproto/scion/pkg/addr"
 	"golang.zx2c4.com/wireguard/conn"
 )
 
@@ -21,12 +21,10 @@ func (device *Device) handleScionUAPISet(key, value string) error {
 	switch key {
 	case "scion_path_policy":
 		return device.setScionPathPolicy(value)
-	case "scion_local_ia":
-		return device.setScionLocalIA(value)
-	case "scion_daemon_addr":
-		return device.setScionDaemonAddr(value)	
 	case "scion_query_paths":
 		return device.queryScionPaths(value)
+	case "scion_set_path":
+		return device.setScionPath(value)
 	default:
 		return fmt.Errorf("unknown SCION UAPI key: %s", key)
 	}
@@ -47,46 +45,47 @@ func (device *Device) setScionPathPolicy(value string) error {
 	return fmt.Errorf("SCION bind not available")
 }
 
+// setScionPath sets a specific path for a destination IA
+func (device *Device) setScionPath(value string) error {
+	device.net.RLock()
+	defer device.net.RUnlock()
 
-// setScionLocalIA sets the local IA for SCION
-func (device *Device) setScionLocalIA(value string) error {
-	device.net.Lock()
-	defer device.net.Unlock()
-
-	ia, err := addr.ParseIA(value)
-	if err != nil {
-		return fmt.Errorf("invalid IA format: %s", value)
+	// Expected format: "IA:path_index" (e.g., "1-105:2")
+	parts := strings.Split(value, ":")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid path selection format, expected 'IA:path_index'")
 	}
 
-	// This would require recreating the bind, which is more complex
-	// For now, just log the attempt
-	device.log.Verbosef("Request to set SCION local IA to: %s (requires restart)", ia)
-	return fmt.Errorf("changing local IA requires device restart")
+	iaStr := parts[0]
+	pathIndex, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return fmt.Errorf("invalid path index: %w", err)
+	}
+
+	if scionBind, ok := device.net.bind.(*conn.ScionNetBind); ok {
+		if err := scionBind.SetPath(iaStr, pathIndex); err != nil {
+			return fmt.Errorf("failed to set path: %w", err)
+		}
+		device.log.Verbosef("Set SCION path for %s to index %d", iaStr, pathIndex)
+		return nil
+	}
+
+	return fmt.Errorf("SCION bind not available")
 }
 
-// setScionDaemonAddr sets the SCION daemon address
-func (device *Device) setScionDaemonAddr(value string) error {
-	device.net.Lock()
-	defer device.net.Unlock()
-
-	// This would require recreating the bind connection
-	device.log.Verbosef("Request to set SCION daemon address to: %s (requires restart)", value)
-	return fmt.Errorf("changing daemon address requires device restart")
-}
-
-
-// queryScionPaths queries available paths to a destination IA (placeholder for now)
+// queryScionPaths queries available paths to a destination IA
 func (device *Device) queryScionPaths(value string) error {
 	device.net.RLock()
 	defer device.net.RUnlock()
 
-	dstIA, err := addr.ParseIA(value)
-	if err != nil {
-		return fmt.Errorf("invalid destination IA: %s", value)
-	}
-
-	if _, ok := device.net.bind.(*conn.ScionNetBind); ok {
-		device.log.Verbosef("Path query requested for %s (not implemented yet)", dstIA)
+	if scionBind, ok := device.net.bind.(*conn.ScionNetBind); ok {
+		jsonStr, err := scionBind.GetPathsJSON(value)
+		if err != nil {
+			return fmt.Errorf("failed to get paths: %w", err)
+		}
+		device.log.Verbosef("Retrieved paths for %s", value)
+		// Write the JSON response to the log since we can't write directly to UAPI
+		device.log.Verbosef("SCION paths for %s: %s", value, jsonStr)
 		return nil
 	}
 
@@ -98,8 +97,10 @@ func (device *Device) writeScionUAPIStatus(buf io.Writer) {
 	device.net.RLock()
 	defer device.net.RUnlock()
 
-	if _, ok := device.net.bind.(*conn.ScionNetBind); ok {
+	if scionBind, ok := device.net.bind.(*conn.ScionNetBind); ok {
 		fmt.Fprintf(buf, "scion_enabled=true\n")
+		// Add current path policy
+		fmt.Fprintf(buf, "scion_path_policy=%s\n", scionBind.GetPathPolicy())
 	} else {
 		fmt.Fprintf(buf, "scion_enabled=false\n")
 	}
@@ -136,7 +137,7 @@ func (peer *Peer) writeScionPeerStatus(buf io.Writer) {
 		if scionAddr := scionEp.GetScionAddr(); scionAddr != nil {
 			fmt.Fprintf(buf, "scion_address=%s\n", scionAddr.String())
 		}
-		
+
 	} else {
 		fmt.Fprintf(buf, "scion_endpoint=false\n")
 	}
