@@ -36,9 +36,8 @@ func (device *Device) setScionPathPolicy(value string) error {
 	defer device.net.Unlock()
 
 	if scionBind, ok := device.net.bind.(*conn.ScionNetBind); ok {
-		policy := conn.ParsePathPolicy(value)
-		scionBind.SetPathPolicy(policy)
-		device.log.Verbosef("Set SCION path policy to: %s", policy)
+		scionBind.SetPathPolicy(value)
+		device.log.Verbosef("Set SCION path policy to: %s", value)
 		return nil
 	}
 
@@ -51,7 +50,7 @@ func (device *Device) setScionPath(value string) error {
 	defer device.net.RUnlock()
 
 	// Expected format: "IA:path_index" (e.g., "1-105:2")
-	parts := strings.Split(value, ":")
+	parts := strings.Split(value, "#")
 	if len(parts) != 2 {
 		return fmt.Errorf("invalid path selection format, expected 'IA:path_index'")
 	}
