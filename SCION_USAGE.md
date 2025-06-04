@@ -128,7 +128,7 @@ EOF
 cat << EOF | sudo socat - UNIX-CONNECT:"$UAPI_SOCKET"
 set=1
 public_key=$PEER_PUBLIC_KEY_HEX
-allowed_ip=10.78.0.1/32
+allowed_ip=10.78.0.0/24
 scion_endpoint=1-ffaa:0:1,[127.0.0.1]:32000
 persistent_keepalive_interval=25
 EOF
