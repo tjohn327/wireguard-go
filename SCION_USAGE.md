@@ -18,6 +18,7 @@ This guide explains how to configure and operate a custom `wireguard-go` instanc
 Before launching `wireguard-go`, set:
 
 * `USE_SCION=1`: Enables SCION support
+* `USE_BATCH=1`: Enables batch mode for Linux and Android (default: `0`)
 * `SCION_LOCAL_IA`: Your local SCION ISD-AS (e.g., `1-ffaa:0:1`); optional if `sciond` provides it
 * `SCION_DAEMON_ADDR`: SCION daemon address; optional (default: `127.0.0.1:30255`)
 
@@ -67,7 +68,7 @@ PRIVATE_KEY_HEX=$(base64 -d private.key | xxd -p -c 256)
 PEER_PUBLIC_KEY_HEX=$(base64 -d peer.key | xxd -p -c 256)
 
 # Start wireguard-go
-sudo  USE_SCION=1 ./wireguard-go $INTERFACE
+sudo  USE_SCION=1 USE_BATCH=1 ./wireguard-go $INTERFACE
 
 # Configure interface
 sudo ip address add "$ADDRESS" dev "$INTERFACE"
@@ -111,7 +112,7 @@ PRIVATE_KEY_HEX=$(base64 -d private.key | xxd -p -c 256)
 PEER_PUBLIC_KEY_HEX=$(base64 -d peer.key | xxd -p -c 256)
 
 # Start wireguard-go
-sudo  USE_SCION=1 ./wireguard-go $INTERFACE
+sudo  USE_SCION=1 USE_BATCH=1 ./wireguard-go $INTERFACE
 
 # Configure interface
 sudo ip address add "$ADDRESS" dev "$INTERFACE"

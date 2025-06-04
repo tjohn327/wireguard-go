@@ -122,7 +122,7 @@ func NewScionNetBind(config *ScionConfig, logger Logger) *ScionNetBind {
 	return &ScionNetBind{
 		config:   config,
 		logger:   logger,
-		useBatch: runtime.GOOS == "linux" || runtime.GOOS == "android",
+		useBatch: useBatch,
 	}
 }
 
