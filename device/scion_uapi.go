@@ -8,7 +8,6 @@ package device
 import (
 	"fmt"
 	"io"
-	"strconv"
 	"strings"
 
 	"golang.zx2c4.com/wireguard/conn"
@@ -21,10 +20,6 @@ func (device *Device) handleScionUAPISet(key, value string) error {
 	switch key {
 	case "scion_path_policy":
 		return device.setScionPathPolicy(value)
-	case "scion_query_paths":
-		return device.queryScionPaths(value)
-	case "scion_set_path":
-		return device.setScionPath(value)
 	default:
 		return fmt.Errorf("unknown SCION UAPI key: %s", key)
 	}
@@ -38,53 +33,6 @@ func (device *Device) setScionPathPolicy(value string) error {
 	if scionBind, ok := device.net.bind.(*conn.ScionNetBind); ok {
 		scionBind.SetPathPolicy(value)
 		device.log.Verbosef("Set SCION path policy to: %s", value)
-		return nil
-	}
-
-	return fmt.Errorf("SCION bind not available")
-}
-
-// setScionPath sets a specific path for a destination IA
-func (device *Device) setScionPath(value string) error {
-	device.net.RLock()
-	defer device.net.RUnlock()
-
-	// Expected format: "IA:path_index" (e.g., "1-105:2")
-	parts := strings.Split(value, "#")
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid path selection format, expected 'IA:path_index'")
-	}
-
-	iaStr := parts[0]
-	pathIndex, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return fmt.Errorf("invalid path index: %w", err)
-	}
-
-	if scionBind, ok := device.net.bind.(*conn.ScionNetBind); ok {
-		if err := scionBind.SetPath(iaStr, pathIndex); err != nil {
-			return fmt.Errorf("failed to set path: %w", err)
-		}
-		device.log.Verbosef("Set SCION path for %s to index %d", iaStr, pathIndex)
-		return nil
-	}
-
-	return fmt.Errorf("SCION bind not available")
-}
-
-// queryScionPaths queries available paths to a destination IA
-func (device *Device) queryScionPaths(value string) error {
-	device.net.RLock()
-	defer device.net.RUnlock()
-
-	if scionBind, ok := device.net.bind.(*conn.ScionNetBind); ok {
-		jsonStr, err := scionBind.GetPathsJSON(value)
-		if err != nil {
-			return fmt.Errorf("failed to get paths: %w", err)
-		}
-		device.log.Verbosef("Retrieved paths for %s", value)
-		// Write the JSON response to the log since we can't write directly to UAPI
-		device.log.Verbosef("SCION paths for %s: %s", value, jsonStr)
 		return nil
 	}
 

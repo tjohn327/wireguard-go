@@ -51,10 +51,11 @@ type ScionBatchConn struct {
 	ipv6RxOffload bool
 
 	// Object pools
-	msgsPool      sync.Pool
-	scionPktPool  sync.Pool
-	singlePktPool sync.Pool
-	udpAddrPool   sync.Pool
+	msgsPool           sync.Pool
+	scionPktPool       sync.Pool
+	scionEmptyPktPool  sync.Pool
+	scionSinglePktPool sync.Pool
+	udpAddrPool        sync.Pool
 
 	// Capabilities
 	batchSize     int
@@ -121,11 +122,15 @@ func NewScionBatchConnWithConfig(
 				return &scionPkts
 			},
 		},
-		singlePktPool: sync.Pool{
+		scionEmptyPktPool: sync.Pool{
 			New: func() any {
-				return &snet.Packet{
-					Bytes: make(snet.Bytes, common.SupportedMTU),
-				}
+				scionPkts := make([]snet.Packet, IdealBatchSize)
+				return &scionPkts
+			},
+		},
+		scionSinglePktPool: sync.Pool{
+			New: func() any {
+				return &snet.Packet{}
 			},
 		},
 		udpAddrPool: sync.Pool{
@@ -268,13 +273,7 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 	msgs := s.getMessages()
 	defer s.putMessages(msgs)
 
-	// Prepare message buffers
-	numBufs := len(bufs)
-	if numBufs > len(*msgs) {
-		numBufs = len(*msgs)
-	}
-
-	for i := 0; i < numBufs; i++ {
+	for i := range bufs {
 		(*msgs)[i].Buffers[0] = bufs[i]
 		(*msgs)[i].OOB = (*msgs)[i].OOB[:cap((*msgs)[i].OOB)]
 	}
@@ -298,7 +297,7 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 				return 0, fmt.Errorf("failed to split coalesced messages: %w", err)
 			}
 		} else {
-			numMsgs, err = ipv4PC.ReadBatch((*msgs)[:numBufs], 0)
+			numMsgs, err = ipv4PC.ReadBatch(*msgs, 0)
 			if err != nil {
 				return 0, fmt.Errorf("IPv4 batch read failed: %w", err)
 			}
@@ -318,23 +317,22 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 				return 0, fmt.Errorf("failed to split coalesced messages: %w", err)
 			}
 		} else {
-			numMsgs, err = ipv6PC.ReadBatch((*msgs)[:numBufs], 0)
+			numMsgs, err = ipv6PC.ReadBatch(*msgs, 0)
 			if err != nil {
 				return 0, fmt.Errorf("IPv6 batch read failed: %w", err)
 			}
 		}
 	}
 
-	// Get a single SCION packet object to reuse for parsing
-	scionPkt := s.singlePktPool.Get().(*snet.Packet)
-	defer s.singlePktPool.Put(scionPkt)
-
-	validPackets := 0
+	scionPkts := s.scionEmptyPktPool.Get().(*[]snet.Packet)
+	defer s.scionEmptyPktPool.Put(scionPkts)
 
 	// Process each message
-	for i := 0; i < numMsgs && validPackets < len(bufs); i++ {
+	for i := 0; i < numMsgs; i++ {
 		msg := &(*msgs)[i]
+		scionPkt := (*scionPkts)[i]
 		if msg.N == 0 {
+			sizes[i] = 0
 			continue
 		}
 
@@ -352,7 +350,7 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 			s.mu.RUnlock()
 
 			if handler != nil {
-				if err := handler.Handle(scionPkt); err != nil {
+				if err := handler.Handle(&scionPkt); err != nil {
 					s.logger.Verbosef("SCMP handler error: %v", err)
 				}
 			}
@@ -397,7 +395,7 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 			NextHop: nextHop,
 		}
 
-		eps[validPackets] = &ScionNetEndpoint{
+		eps[i] = &ScionNetEndpoint{
 			StdNetEndpoint: StdNetEndpoint{
 				AddrPort: netip.AddrPortFrom(
 					netip.MustParseAddr(scionAddr.NextHop.IP.String()),
@@ -406,22 +404,21 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 			scionAddr: scionAddr,
 		}
 
-		if scionEp, ok := eps[validPackets].(*ScionNetEndpoint); ok {
+		if scionEp, ok := eps[i].(*ScionNetEndpoint); ok {
 			getSrcFromControl(msg.OOB[:msg.NN], &scionEp.StdNetEndpoint)
 		}
 
 		payloadLen := len(udp.Payload)
-		if payloadLen > len(bufs[validPackets]) {
-			s.logger.Verbosef("UDP payload too large (%d bytes) for buffer (%d bytes)", payloadLen, len(bufs[validPackets]))
+		if payloadLen > len(bufs[i]) {
+			s.logger.Verbosef("UDP payload too large (%d bytes) for buffer (%d bytes)", payloadLen, len(bufs[i]))
 			continue
 		}
 
-		sizes[validPackets] = payloadLen
-		copy(bufs[validPackets], udp.Payload)
-		validPackets++
+		sizes[i] = payloadLen
+		copy(bufs[i], udp.Payload)
 	}
 
-	return validPackets, nil
+	return numMsgs, nil
 }
 
 // WriteBatch sends multiple SCION packets in a single syscall
@@ -619,8 +616,8 @@ func (s *ScionBatchConn) readSingle(buf []byte, sizes []int, eps []Endpoint) (in
 	conn := s.conn
 	s.mu.RUnlock()
 
-	pkt := s.singlePktPool.Get().(*snet.Packet)
-	defer s.singlePktPool.Put(pkt)
+	pkt := s.scionSinglePktPool.Get().(*snet.Packet)
+	defer s.scionSinglePktPool.Put(pkt)
 
 	pkt.Bytes = snet.Bytes(buf)
 	n, remoteAddr, err := conn.ReadFrom(buf)
@@ -716,8 +713,8 @@ func (s *ScionBatchConn) writeSingle(buf []byte, ep Endpoint) error {
 		return ErrInvalidEndpointType
 	}
 
-	scionPkt := s.singlePktPool.Get().(*snet.Packet)
-	defer s.singlePktPool.Put(scionPkt)
+	scionPkt := s.scionSinglePktPool.Get().(*snet.Packet)
+	defer s.scionSinglePktPool.Put(scionPkt)
 
 	scionPkt.PacketInfo = snet.PacketInfo{
 		Destination: snet.SCIONAddress{
