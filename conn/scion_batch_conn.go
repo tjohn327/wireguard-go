@@ -1,3 +1,7 @@
+// SCION Batch Connection for WireGuard backend.
+// Provides batch send/receive capabilities for SCION packets.
+// Uses UDP batching for performance.
+
 package conn
 
 import (

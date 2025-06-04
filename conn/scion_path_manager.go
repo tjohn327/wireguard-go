@@ -1,17 +1,6 @@
-/*
- *
- * Path manager for SCION-aware WireGuard backend.
- *
- * This file is intended to live in the same Go package (conn) as bind_scion.go
- * and can be dropped next to it.  No changes outside of the conn package are
- * necessary – once the file is built into the module the SCION bind will
- * automatically pick it up.
- *
- * The manager keeps a per‑destination cache of SCION paths that is refreshed
- * in the background.  Retrieval and scoring of paths is delegated to the SCION
- * daemon (sciond) via the daemon.Connector interface that bind_scion.go
- * already initialises.
- */
+// SCION Path Manager for WireGuard backend.
+// Maintains per-destination SCION path cache, refreshed in background.
+// Uses sciond via daemon.Connector from bind_scion.go.
 
 package conn
 

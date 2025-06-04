@@ -1,3 +1,6 @@
+// SCION Utility Functions for WireGuard backend.
+// Provides helper functions for SCION packet serialization and validation.
+
 package conn
 
 import (
@@ -209,11 +212,6 @@ func Serialize(p *snet.Packet) error {
 // (same address types, path types, and path lengths). It serializes the first
 // packet completely, then uses it as a template for subsequent packets,
 // updating only the dynamic fields (payload length, UDP length, and payload data).
-//
-// Performance benefits:
-// - Avoids repeated SCION header construction
-// - Reduces memory allocations
-// - Optimizes for common use case where multiple packets share structure
 //
 // Preconditions:
 // - All packets must be valid for UDP serialization

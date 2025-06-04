@@ -1,3 +1,6 @@
+// SCION Network Bind for WireGuard backend.
+// Provides SCION network support for WireGuard.
+
 package conn
 
 import (
