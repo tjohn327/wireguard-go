@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -14,7 +15,6 @@ import (
 	"github.com/scionproto/scion/pkg/daemon"
 	"github.com/scionproto/scion/pkg/snet"
 )
-
 
 var (
 	_ Bind = (*ScionNetBind)(nil)
@@ -111,6 +111,11 @@ var (
 )
 
 func NewScionNetBind(config *ScionConfig, logger Logger) *ScionNetBind {
+	useBatch := os.Getenv("USE_BATCH") == "1"
+	if useBatch {
+		useBatch = runtime.GOOS == "linux" || runtime.GOOS == "android"
+	}
+
 	return &ScionNetBind{
 		config:   config,
 		logger:   logger,
@@ -279,13 +284,12 @@ func (s *ScionNetBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 	return fns, actualPort, nil
 }
 
-
 func (s *ScionNetBind) makeReceiveBatch() ReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
 		s.mu.Lock()
 		batchConn := s.batchConn
 		s.mu.Unlock()
-		
+
 		if batchConn == nil {
 			return 0, net.ErrClosed
 		}
@@ -298,7 +302,7 @@ func (s *ScionNetBind) makeReceiveSCION() ReceiveFunc {
 		s.mu.Lock()
 		scionConn := s.scionConn
 		s.mu.Unlock()
-		
+
 		if scionConn == nil {
 			return 0, net.ErrClosed
 		}
@@ -315,7 +319,7 @@ func (s *ScionNetBind) makeReceiveSCION() ReceiveFunc {
 		// Convert net.Addr to our endpoint type
 		if scionAddr, ok := remote.(*snet.UDPAddr); ok {
 			addrPort := netip.AddrPortFrom(
-				netip.MustParseAddr(scionAddr.NextHop.IP.String()), 
+				netip.MustParseAddr(scionAddr.NextHop.IP.String()),
 				uint16(scionAddr.NextHop.Port),
 			)
 			eps[0] = &ScionNetEndpoint{
@@ -428,22 +432,22 @@ func (s *ScionNetBind) ParseEndpoint(str string) (Endpoint, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse SCION address %s: %w", str, err)
 		}
-		
+
 		scionEndpoint := &ScionNetEndpoint{
 			scionAddr: scionAddr,
 		}
-		
+
 		s.mu.Lock()
 		pathManager := s.pathManager
 		s.mu.Unlock()
-		
+
 		if pathManager != nil {
 			pathManager.RegisterEndpoint(scionAddr.IA)
 			if p, err := pathManager.GetPath(scionAddr.IA); err == nil {
 				scionAddr.Path = p.Dataplane()
 				scionAddr.NextHop = p.UnderlayNextHop()
 				scionEndpoint.StdNetEndpoint.AddrPort = netip.AddrPortFrom(
-					netip.MustParseAddr(scionAddr.NextHop.IP.String()), 
+					netip.MustParseAddr(scionAddr.NextHop.IP.String()),
 					uint16(scionAddr.NextHop.Port),
 				)
 			}
@@ -457,7 +461,7 @@ func (s *ScionNetBind) ParseEndpoint(str string) (Endpoint, error) {
 func (s *ScionNetBind) BatchSize() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	if s.batchConn != nil {
 		return s.batchConn.BatchSize()
 	}
@@ -468,13 +472,13 @@ func (s *ScionNetBind) BatchSize() int {
 func (s *ScionNetBind) SetPathPolicy(policy string) {
 	s.pathMu.Lock()
 	defer s.pathMu.Unlock()
-	
+
 	s.pathPolicy = ParsePathPolicy(policy)
-	
+
 	s.mu.Lock()
 	pathManager := s.pathManager
 	s.mu.Unlock()
-	
+
 	if pathManager != nil {
 		pathManager.SetPolicy(policy)
 	}
@@ -488,7 +492,7 @@ func (e *ScionNetEndpoint) SetScionAndIPAddresses(scionAddr *snet.UDPAddr) {
 	e.scionAddr = scionAddr
 	if scionAddr != nil && scionAddr.NextHop != nil {
 		e.StdNetEndpoint.AddrPort = netip.AddrPortFrom(
-			netip.MustParseAddr(scionAddr.NextHop.IP.String()), 
+			netip.MustParseAddr(scionAddr.NextHop.IP.String()),
 			uint16(scionAddr.NextHop.Port),
 		)
 	}
@@ -499,7 +503,7 @@ func (bind *ScionNetBind) GetPathsJSON(iaStr string) (string, error) {
 	bind.mu.Lock()
 	pathManager := bind.pathManager
 	bind.mu.Unlock()
-	
+
 	if pathManager == nil {
 		return "", fmt.Errorf("path manager not initialized")
 	}
@@ -511,7 +515,7 @@ func (bind *ScionNetBind) SetPath(iaStr string, pathIndex int) error {
 	bind.mu.Lock()
 	pathManager := bind.pathManager
 	bind.mu.Unlock()
-	
+
 	if pathManager == nil {
 		return fmt.Errorf("path manager not initialized")
 	}
@@ -523,7 +527,7 @@ func (bind *ScionNetBind) GetPathPolicy() string {
 	bind.mu.Lock()
 	pathManager := bind.pathManager
 	bind.mu.Unlock()
-	
+
 	if pathManager == nil {
 		return "unknown"
 	}

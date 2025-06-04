@@ -57,7 +57,8 @@ type ScionBatchConn struct {
 	udpAddrPool   sync.Pool
 
 	// Capabilities
-	batchSize int
+	batchSize     int
+	fastSerialize bool
 }
 
 // ScionBatchConnConfig holds configuration options for ScionBatchConn
@@ -155,6 +156,10 @@ func NewScionBatchConnWithConfig(
 		sbc.batchSize = IdealBatchSize
 	}
 
+	if sbc.ipv4TxOffload || sbc.ipv6TxOffload {
+		sbc.fastSerialize = true
+	}
+
 	sbc.msgsPool = sync.Pool{
 		New: func() any {
 			msgs := make([]ipv6.Message, IdealBatchSize)
@@ -166,7 +171,7 @@ func NewScionBatchConnWithConfig(
 		},
 	}
 
-	logger.Verbosef("Created ScionBatchConn with batch size %d, IPv4 TX/RX offload: %t/%t, IPv6 TX/RX offload: %t/%t",
+	logger.Verbosef("Created ScionBatchConn with batch size %d, IPv4 TX/RX offload: %v/%v, IPv6 TX/RX offload: %v/%v",
 		sbc.batchSize, sbc.ipv4TxOffload, sbc.ipv4RxOffload, sbc.ipv6TxOffload, sbc.ipv6RxOffload)
 
 	return sbc
@@ -435,6 +440,7 @@ func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
 	ipv6PC := s.ipv6PC
 	ipv4TxOffload := s.ipv4TxOffload
 	ipv6TxOffload := s.ipv6TxOffload
+	fastSerialize := s.fastSerialize
 	s.mu.RUnlock()
 
 	if ipv4PC == nil && ipv6PC == nil {
@@ -499,10 +505,18 @@ func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
 			Payload: buf,
 		}
 
-		if err := (*scionPkts)[i].Serialize(); err != nil {
-			return fmt.Errorf("failed to serialize SCION packet %d: %w", i, err)
+		if !fastSerialize {
+			if err := (*scionPkts)[i].Serialize(); err != nil {
+				return fmt.Errorf("failed to serialize SCION packet %d: %w", i, err)
+			}
+			sbufs[i] = (*scionPkts)[i].Bytes
 		}
-		sbufs[i] = (*scionPkts)[i].Bytes
+	}
+
+	if fastSerialize {
+		if err := SerializeBatch((*scionPkts)[:len(bufs)], sbufs); err != nil {
+			return fmt.Errorf("failed to serialize SCION packets: %w", err)
+		}
 	}
 
 	// Send batch with retry logic
