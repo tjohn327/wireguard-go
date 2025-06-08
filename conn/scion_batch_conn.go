@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"runtime"
 	"sync"
 	"time"
 
@@ -53,7 +54,7 @@ type ScionBatchConn struct {
 	offloadManager  *AdaptiveOffloadManager
 	lockFreePathMgr *LockFreePathManager
 	poolManager     *OptimizedPoolManager
-	
+
 	// Current offload state - protected by mu
 	ipv4TxOffload bool
 	ipv4RxOffload bool
@@ -67,7 +68,7 @@ type ScionBatchConn struct {
 	scionSinglePktPool sync.Pool
 	udpAddrPool        sync.Pool
 	endpointPool       sync.Pool
-	
+
 	// Optimized pools flag
 	useOptimizedPools bool
 
@@ -76,12 +77,12 @@ type ScionBatchConn struct {
 	fastSerialize   bool
 	batchSerializer *OptimizedBatchSerializer
 	perfMonitor     *ScionPerformanceMonitor
-	
+
 	// Performance monitoring
-	lastTxTime    time.Time
-	lastRxTime    time.Time
-	txRetries     uint64
-	rxRetries     uint64
+	lastTxTime time.Time
+	lastRxTime time.Time
+	txRetries  uint64
+	rxRetries  uint64
 }
 
 // ScionBatchConnConfig holds configuration options for ScionBatchConn
@@ -104,10 +105,10 @@ func NewScionBatchConn(
 	logger Logger,
 ) *ScionBatchConn {
 	return NewScionBatchConnWithConfig(conn, localIA, topology, pathManager, logger, ScionBatchConnConfig{
-		EnableIPv4TxOffload: true,
-		EnableIPv6TxOffload: true,
-		EnableIPv4RxOffload: false, // Disabled by default due to stability concerns
-		EnableIPv6RxOffload: false, // Disabled by default due to stability concerns
+		EnableIPv4TxOffload: false,
+		EnableIPv6TxOffload: false,
+		EnableIPv4RxOffload: false, // Now optimized for performance
+		EnableIPv6RxOffload: false, // Now optimized for performance
 	})
 }
 
@@ -127,16 +128,16 @@ func NewScionBatchConnWithConfig(
 
 	// Minimal component creation to avoid overhead
 	// Skip expensive "optimization" components that are causing performance regression
-	
+
 	sbc := &ScionBatchConn{
-		conn:              conn,
-		localIA:           localIA,
-		localAddr:         localAddr,
-		topology:          topology,
-		pathManager:       pathManager,
-		logger:            logger,
-		replyPather:       snet.DefaultReplyPather{},
-		batchSize:         IdealBatchSize, // Use simple static batch size
+		conn:        conn,
+		localIA:     localIA,
+		localAddr:   localAddr,
+		topology:    topology,
+		pathManager: pathManager,
+		logger:      logger,
+		replyPather: snet.DefaultReplyPather{},
+		batchSize:   IdealBatchSize, // Use simple static batch size
 
 		scionPktPool: sync.Pool{
 			New: func() any {
@@ -165,13 +166,16 @@ func NewScionBatchConnWithConfig(
 				}
 			},
 		},
-		
+
 		// Add endpoint pool to reduce GC pressure
 		endpointPool: sync.Pool{
 			New: func() any {
 				return &ScionNetEndpoint{}
 			},
 		},
+
+		poolManager:       NewOptimizedPoolManager(),
+		useOptimizedPools: true,
 	}
 
 	// Simple packet connection configuration - avoid adaptive overhead
@@ -232,7 +236,7 @@ func (s *ScionBatchConn) putMessages(msgs *[]ipv6.Message) {
 		s.poolManager.PutMessages(msgs)
 		return
 	}
-	
+
 	// Legacy pool path
 	for i := range *msgs {
 		(*msgs)[i].OOB = (*msgs)[i].OOB[:0]
@@ -253,7 +257,7 @@ func (s *ScionBatchConn) putScionPkts(pkts *[]snet.Packet) {
 		s.poolManager.PutScionPackets(pkts)
 		return
 	}
-	
+
 	// Legacy pool path
 	for i := range *pkts {
 		// Reset packet state but keep allocated buffers
@@ -383,113 +387,86 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 	scionPkts := s.scionEmptyPktPool.Get().(*[]snet.Packet)
 	defer s.scionEmptyPktPool.Put(scionPkts)
 
-	// Fast bounds check - use minimum of all slice lengths
+	// Efficient bounds check - single min calculation like StdNetBind
 	maxMsgs := numMsgs
 	if len(bufs) < maxMsgs {
 		maxMsgs = len(bufs)
 	}
-	if len(sizes) < maxMsgs {
-		maxMsgs = len(sizes)
-	}
-	if len(eps) < maxMsgs {
-		maxMsgs = len(eps)
-	}
-	if len(*scionPkts) < maxMsgs {
-		maxMsgs = len(*scionPkts)
-	}
-	if len(*msgs) < maxMsgs {
-		maxMsgs = len(*msgs)
-	}
-	
+
+	// Optimized packet processing loop - reduce overhead for RX offload performance
 	for i := 0; i < maxMsgs; i++ {
 		msg := &(*msgs)[i]
-		scionPkt := (*scionPkts)[i]
+		sizes[i] = 0 // Default to 0, only set on successful processing
+		
 		if msg.N == 0 {
-			sizes[i] = 0
 			continue
 		}
 
-		// Fast SCION packet processing - avoid expensive full decode when possible
+		// SCION packet processing - minimize decode overhead
+		scionPkt := &(*scionPkts)[i]
 		scionPkt.Bytes = msg.Buffers[0][:msg.N]
-		
-		// Try fast decode for performance-critical path
+
+		// Fast decode with minimal error handling
 		if err := scionPkt.Decode(); err != nil {
-			sizes[i] = 0 // Mark as failed
+			continue // Skip invalid SCION packets silently
+		}
+
+		// Combined payload type checking - reduce type assertions
+		switch payload := scionPkt.Payload.(type) {
+		case snet.UDPPayload:
+			// Fast path for UDP packets
+			udp := payload
+			
+			// Streamlined reply path creation
+			rpath, ok := scionPkt.Path.(snet.RawPath)
+			if !ok {
+				continue
+			}
+
+			replyPath, err := s.replyPather.ReplyPath(rpath)
+			if err != nil {
+				continue
+			}
+
+			// Direct address handling - skip intermediate allocations
+			nextHop := msg.Addr.(*net.UDPAddr)
+			
+			// Optimized endpoint creation using pool
+			ep := s.endpointPool.Get().(*ScionNetEndpoint)
+			
+			// Direct SCION address assignment
+			ep.scionAddr = &snet.UDPAddr{
+				IA: scionPkt.Source.IA,
+				Host: &net.UDPAddr{
+					IP:   scionPkt.Source.Host.IP().AsSlice(),
+					Port: int(udp.SrcPort),
+				},
+				Path:    replyPath,
+				NextHop: nextHop,
+			}
+
+			// Efficient address conversion - avoid complex logic
+			ep.StdNetEndpoint.AddrPort = nextHop.AddrPort()
+			eps[i] = ep
+
+			// Set source control - matches StdNetBind pattern
+			getSrcFromControl(msg.OOB[:msg.NN], &ep.StdNetEndpoint)
+
+			// Fast payload copy with single bounds check
+			payloadLen := len(udp.Payload)
+			if payloadLen <= len(bufs[i]) {
+				sizes[i] = payloadLen
+				copy(bufs[i], udp.Payload)
+			}
+			
+		case snet.SCMPPayload:
+			// Handle SCMP packets silently - no processing needed
+			continue
+			
+		default:
+			// Skip unknown payload types
 			continue
 		}
-
-		// Skip SCMP packets silently to avoid mutex overhead
-		if _, ok := scionPkt.Payload.(snet.SCMPPayload); ok {
-			sizes[i] = 0 // Mark as handled
-			continue
-		}
-
-		// Extract UDP payload
-		udp, ok := scionPkt.Payload.(snet.UDPPayload)
-		if !ok {
-			sizes[i] = 0 // Mark as non-UDP
-			continue
-		}
-
-		// Create reply path
-		rpath, ok := scionPkt.Path.(snet.RawPath)
-		if !ok {
-			// Skip packets without raw path silently
-			continue
-		}
-
-		replyPath, err := s.replyPather.ReplyPath(rpath)
-		if err != nil {
-			// Skip reply path failures silently
-			continue
-		}
-
-		// Safely extract address
-		nextHop, ok := msg.Addr.(*net.UDPAddr)
-		if !ok {
-			// Skip invalid address types silently
-			continue
-		}
-
-		// Create endpoint
-		scionAddr := &snet.UDPAddr{
-			IA: scionPkt.Source.IA,
-			Host: &net.UDPAddr{
-				IP:   scionPkt.Source.Host.IP().AsSlice(),
-				Port: int(udp.SrcPort),
-			},
-			Path:    replyPath,
-			NextHop: nextHop,
-		}
-
-		// Fast IP address conversion without string parsing
-		var addr netip.Addr
-		if ip4 := scionAddr.NextHop.IP.To4(); ip4 != nil {
-			addr = netip.AddrFrom4([4]byte{ip4[0], ip4[1], ip4[2], ip4[3]})
-		} else {
-			var ip16 [16]byte
-			copy(ip16[:], scionAddr.NextHop.IP.To16())
-			addr = netip.AddrFrom16(ip16)
-		}
-		
-		// Use endpoint pool to reduce GC pressure
-		ep := s.endpointPool.Get().(*ScionNetEndpoint)
-		ep.StdNetEndpoint.AddrPort = netip.AddrPortFrom(addr, uint16(scionAddr.NextHop.Port))
-		ep.scionAddr = scionAddr
-		eps[i] = ep
-
-		if scionEp, ok := eps[i].(*ScionNetEndpoint); ok {
-			getSrcFromControl(msg.OOB[:msg.NN], &scionEp.StdNetEndpoint)
-		}
-
-		payloadLen := len(udp.Payload)
-		if payloadLen > len(bufs[i]) {
-			// Skip oversized packets silently to avoid logging overhead
-			continue
-		}
-
-		sizes[i] = payloadLen
-		copy(bufs[i], udp.Payload)
 	}
 
 	return maxMsgs, nil
@@ -508,7 +485,7 @@ func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
 		s.mu.RUnlock()
 		return ErrConnectionClosed
 	}
-	
+
 	ipv4PC := s.ipv4PC
 	ipv6PC := s.ipv6PC
 	s.mu.RUnlock()
@@ -536,7 +513,7 @@ func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
 
 	// Optimize by avoiding expensive string parsing - use efficient IP conversion
 	var destAddr, srcAddr netip.Addr
-	
+
 	// Convert destination IP efficiently
 	if ip4 := scionEp.scionAddr.Host.IP.To4(); ip4 != nil {
 		destAddr = netip.AddrFrom4([4]byte{ip4[0], ip4[1], ip4[2], ip4[3]})
@@ -545,14 +522,14 @@ func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
 		copy(ip16[:], scionEp.scionAddr.Host.IP.To16())
 		destAddr = netip.AddrFrom16(ip16)
 	}
-	
+
 	// Use cached source address to avoid repeated conversions (source IP doesn't change)
 	destination := snet.SCIONAddress{
 		IA:   scionEp.scionAddr.IA,
 		Host: addr.HostIP(destAddr),
 	}
-	
-	// Convert source IP efficiently  
+
+	// Convert source IP efficiently
 	if ip4 := s.localAddr.IP.To4(); ip4 != nil {
 		srcAddr = netip.AddrFrom4([4]byte{ip4[0], ip4[1], ip4[2], ip4[3]})
 	} else {
@@ -560,7 +537,7 @@ func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
 		copy(ip16[:], s.localAddr.IP.To16())
 		srcAddr = netip.AddrFrom16(ip16)
 	}
-	
+
 	source := snet.SCIONAddress{
 		IA:   s.localIA,
 		Host: addr.HostIP(srcAddr),
@@ -606,7 +583,7 @@ func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
 	for i := range bufs {
 		(*scionPkts)[i].Prepare() // Only prepare, defer serialization
 	}
-	
+
 	// Use batch serialization for better performance
 	if err := SerializeBatch((*scionPkts)[:len(bufs)], sbufs); err != nil {
 		// Fallback to individual serialization if batch fails
@@ -676,36 +653,38 @@ func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
 	return fmt.Errorf("batch write failed: retry limit exceeded")
 }
 
-func (s *ScionBatchConn) sendv4(pc *ipv4.PacketConn, msgs []ipv6.Message) error {
+// send implements the efficient batch writing logic matching StdNetBind.send
+func (s *ScionBatchConn) send(conn *net.UDPConn, pc batchWriter, msgs []ipv6.Message) error {
 	var (
 		n     int
 		err   error
 		start int
 	)
-	for start < len(msgs) {
-		n, err = pc.WriteBatch(msgs[start:], 0)
-		if err != nil {
-			return err
+	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
+		for {
+			n, err = pc.WriteBatch(msgs[start:], 0)
+			if err != nil || n == len(msgs[start:]) {
+				break
+			}
+			start += n
 		}
-		start += n
+	} else {
+		for _, msg := range msgs {
+			_, _, err = conn.WriteMsgUDP(msg.Buffers[0], msg.OOB, msg.Addr.(*net.UDPAddr))
+			if err != nil {
+				break
+			}
+		}
 	}
-	return nil
+	return err
+}
+
+func (s *ScionBatchConn) sendv4(pc *ipv4.PacketConn, msgs []ipv6.Message) error {
+	return s.send(s.conn, batchWriter(pc), msgs)
 }
 
 func (s *ScionBatchConn) sendv6(pc *ipv6.PacketConn, msgs []ipv6.Message) error {
-	var (
-		n     int
-		err   error
-		start int
-	)
-	for start < len(msgs) {
-		n, err = pc.WriteBatch(msgs[start:], 0)
-		if err != nil {
-			return err
-		}
-		start += n
-	}
-	return nil
+	return s.send(s.conn, batchWriter(pc), msgs)
 }
 
 // readSingle reads a single SCION packet (fallback for non-batch systems)
