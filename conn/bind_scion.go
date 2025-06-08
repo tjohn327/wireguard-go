@@ -397,8 +397,15 @@ func (s *ScionNetBind) Send(bufs [][]byte, ep Endpoint) error {
 	useBatch := s.useBatch
 	s.mu.Unlock()
 
-	// Update path if path manager is available
-	if pathManager != nil {
+	// Update path using optimized path management
+	if batchConn != nil && batchConn.lockFreePathMgr != nil {
+		// Use lock-free path manager for better performance
+		if p, ok := batchConn.lockFreePathMgr.GetPathFast(scionEp.scionAddr.IA); ok {
+			scionEp.scionAddr.Path = p.Dataplane()
+			scionEp.scionAddr.NextHop = p.UnderlayNextHop()
+		}
+	} else if pathManager != nil {
+		// Fallback to traditional path manager
 		if p, err := pathManager.GetPath(scionEp.scionAddr.IA); err == nil {
 			scionEp.scionAddr.Path = p.Dataplane()
 			scionEp.scionAddr.NextHop = p.UnderlayNextHop()

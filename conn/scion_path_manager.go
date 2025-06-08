@@ -129,6 +129,11 @@ func (pm *PathManager) loop() {
 	}
 }
 
+// DaemonConnector returns the daemon connector for advanced path management
+func (pm *PathManager) DaemonConnector() daemon.Connector {
+	return pm.d
+}
+
 // Close stops the background refresh.  It is safe to call Close more than
 // once.
 func (pm *PathManager) Close() {
