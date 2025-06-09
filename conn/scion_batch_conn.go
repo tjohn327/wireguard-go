@@ -86,8 +86,8 @@ func NewScionBatchConn(
 	logger Logger,
 ) *ScionBatchConn {
 	return NewScionBatchConnWithConfig(conn, localIA, topology, pathManager, logger, ScionBatchConnConfig{
-		EnableIPv4TxOffload: true,
-		EnableIPv6TxOffload: true,
+		EnableIPv4TxOffload: false,
+		EnableIPv6TxOffload: false,
 		EnableIPv4RxOffload: false, // Disabled by default due to stability concerns
 		EnableIPv6RxOffload: false, // Disabled by default due to stability concerns
 	})
@@ -256,17 +256,20 @@ func (s *ScionBatchConn) BatchSize() int {
 }
 
 // ReadBatch reads multiple SCION packets in a single syscall
-func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (int, error) {
+func (s *ScionBatchConn) ReadBatch(
+	ipv4PC *ipv4.PacketConn,
+	ipv6PC *ipv6.PacketConn,
+	ipv4RxOffload bool,
+	ipv6RxOffload bool,
+	bufs [][]byte,
+	sizes []int,
+	eps []Endpoint,
+) (int, error) {
 	s.mu.RLock()
 	if s.closed {
 		s.mu.RUnlock()
 		return 0, ErrConnectionClosed
 	}
-
-	ipv4PC := s.ipv4PC
-	ipv6PC := s.ipv6PC
-	ipv4RxOffload := s.ipv4RxOffload
-	ipv6RxOffload := s.ipv6RxOffload
 	s.mu.RUnlock()
 
 	if ipv4PC == nil && ipv6PC == nil {
@@ -426,22 +429,23 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 }
 
 // WriteBatch sends multiple SCION packets in a single syscall
-func (s *ScionBatchConn) WriteBatch(bufs [][]byte, endpoint Endpoint) error {
+func (s *ScionBatchConn) WriteBatch(
+	ipv4PC *ipv4.PacketConn,
+	ipv6PC *ipv6.PacketConn,
+	ipv4TxOffload bool,
+	ipv6TxOffload bool,
+	bufs [][]byte,
+	endpoint Endpoint,
+) error {
 	if len(bufs) == 0 {
 		return nil
 	}
-
+	fastSerialize := s.fastSerialize
 	s.mu.RLock()
 	if s.closed {
 		s.mu.RUnlock()
 		return ErrConnectionClosed
 	}
-
-	ipv4PC := s.ipv4PC
-	ipv6PC := s.ipv6PC
-	ipv4TxOffload := s.ipv4TxOffload
-	ipv6TxOffload := s.ipv6TxOffload
-	fastSerialize := s.fastSerialize
 	s.mu.RUnlock()
 
 	if ipv4PC == nil && ipv6PC == nil {

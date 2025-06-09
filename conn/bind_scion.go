@@ -291,12 +291,16 @@ func (s *ScionNetBind) makeReceiveBatch() ReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
 		s.mu.Lock()
 		batchConn := s.batchConn
+		ipv4PC := s.batchConn.ipv4PC
+		ipv6PC := s.batchConn.ipv6PC
+		ipv4RxOffload := s.batchConn.ipv4RxOffload
+		ipv6RxOffload := s.batchConn.ipv6RxOffload
 		s.mu.Unlock()
 
 		if batchConn == nil {
 			return 0, net.ErrClosed
 		}
-		return batchConn.ReadBatch(bufs, sizes, eps)
+		return batchConn.ReadBatch(ipv4PC, ipv6PC, ipv4RxOffload, ipv6RxOffload, bufs, sizes, eps)
 	}
 }
 
@@ -394,6 +398,10 @@ func (s *ScionNetBind) Send(bufs [][]byte, ep Endpoint) error {
 	pathManager := s.pathManager
 	batchConn := s.batchConn
 	scionConn := s.scionConn
+	ipv4PC := s.batchConn.ipv4PC
+	ipv6PC := s.batchConn.ipv6PC
+	ipv4TxOffload := s.batchConn.ipv4TxOffload
+	ipv6TxOffload := s.batchConn.ipv6TxOffload
 	useBatch := s.useBatch
 	s.mu.Unlock()
 
@@ -407,7 +415,7 @@ func (s *ScionNetBind) Send(bufs [][]byte, ep Endpoint) error {
 
 	// Use batch connection if available
 	if batchConn != nil && useBatch {
-		return batchConn.WriteBatch(bufs, scionEp)
+		return batchConn.WriteBatch(ipv4PC, ipv6PC, ipv4TxOffload, ipv6TxOffload, bufs, scionEp)
 	}
 
 	// Fallback to regular SCION connection
