@@ -16,85 +16,85 @@ import (
 // ScionPerformanceMonitor provides comprehensive performance monitoring for SCION connections
 type ScionPerformanceMonitor struct {
 	mu sync.RWMutex
-	
+
 	// Basic performance counters
 	packetsTransmitted atomic.Uint64
 	packetsReceived    atomic.Uint64
 	bytesTransmitted   atomic.Uint64
 	bytesReceived      atomic.Uint64
-	
+
 	// Error counters
-	transmitErrors     atomic.Uint64
-	receiveErrors      atomic.Uint64
-	pathErrors         atomic.Uint64
+	transmitErrors      atomic.Uint64
+	receiveErrors       atomic.Uint64
+	pathErrors          atomic.Uint64
 	serializationErrors atomic.Uint64
-	
+
 	// Latency tracking
-	txLatencySum       atomic.Uint64 // nanoseconds
-	rxLatencySum       atomic.Uint64 // nanoseconds
-	txLatencyCount     atomic.Uint64
-	rxLatencyCount     atomic.Uint64
-	maxTxLatency       atomic.Uint64 // nanoseconds
-	maxRxLatency       atomic.Uint64 // nanoseconds
-	
+	txLatencySum   atomic.Uint64 // nanoseconds
+	rxLatencySum   atomic.Uint64 // nanoseconds
+	txLatencyCount atomic.Uint64
+	rxLatencyCount atomic.Uint64
+	maxTxLatency   atomic.Uint64 // nanoseconds
+	maxRxLatency   atomic.Uint64 // nanoseconds
+
 	// Throughput tracking
 	lastThroughputCheck time.Time
-	prevTxPackets      uint64
-	prevRxPackets      uint64
+	prevTxPackets       uint64
+	prevRxPackets       uint64
 	currentTxThroughput atomic.Uint64 // packets per second
 	currentRxThroughput atomic.Uint64 // packets per second
-	
+
 	// Performance buckets for detailed analysis
-	latencyBuckets     [10]atomic.Uint64 // Latency distribution
-	sizeBuckets        [8]atomic.Uint64  // Packet size distribution
-	
+	latencyBuckets [10]atomic.Uint64 // Latency distribution
+	sizeBuckets    [8]atomic.Uint64  // Packet size distribution
+
 	// Component-specific metrics
-	offloadMetrics     OffloadMetrics
-	pathMetrics        PathMetrics
-	poolMetrics        PoolMetrics
+	offloadMetrics       OffloadMetrics
+	pathMetrics          PathMetrics
+	poolMetrics          PoolMetrics
 	serializationMetrics SerializationMetrics
-	
+
 	// Configuration
-	enabledMetrics     uint32 // Bitfield for enabled metric categories
-	samplingRate       float64 // 0.0 to 1.0, controls sampling frequency
-	
+	enabledMetrics uint32  // Bitfield for enabled metric categories
+	samplingRate   float64 // 0.0 to 1.0, controls sampling frequency
+
 	// Monitoring state
-	startTime          time.Time
-	lastResetTime      time.Time
-	monitoringEnabled  atomic.Bool
+	startTime         time.Time
+	lastResetTime     time.Time
+	monitoringEnabled atomic.Bool
 }
 
 // OffloadMetrics tracks hardware offload performance
 type OffloadMetrics struct {
-	GSO_Attempts       atomic.Uint64
-	GSO_Successes      atomic.Uint64
-	GSO_Failures       atomic.Uint64
-	GRO_Attempts       atomic.Uint64
-	GRO_Successes      atomic.Uint64
-	GRO_Failures       atomic.Uint64
-	OffloadDisabled    atomic.Uint64 // Times offload was disabled due to errors
-	FallbackActivated  atomic.Uint64 // Times fallback mode was activated
+	GSO_Attempts      atomic.Uint64
+	GSO_Successes     atomic.Uint64
+	GSO_Failures      atomic.Uint64
+	GRO_Attempts      atomic.Uint64
+	GRO_Successes     atomic.Uint64
+	GRO_Failures      atomic.Uint64
+	OffloadDisabled   atomic.Uint64 // Times offload was disabled due to errors
+	FallbackActivated atomic.Uint64 // Times fallback mode was activated
 }
 
 // PathMetrics tracks SCION path management performance
 type PathMetrics struct {
-	PathLookups        atomic.Uint64
-	PathCacheHits      atomic.Uint64
-	PathCacheMisses    atomic.Uint64
-	PathUpdates        atomic.Uint64
-	PathFailures       atomic.Uint64
-	PathSelectionTime  atomic.Uint64 // Total time in nanoseconds
-	ActivePaths        atomic.Uint64 // Current number of active paths
+	PathLookups       atomic.Uint64
+	PathCacheHits     atomic.Uint64
+	PathCacheMisses   atomic.Uint64
+	PathUpdates       atomic.Uint64
+	PathFailures      atomic.Uint64
+	PathSelectionTime atomic.Uint64 // Total time in nanoseconds
+	ActivePaths       atomic.Uint64 // Current number of active paths
 }
 
 // PoolMetrics tracks memory pool efficiency
 type PoolMetrics struct {
-	PoolAllocations    atomic.Uint64
-	PoolDeallocations  atomic.Uint64
-	PoolHits           atomic.Uint64
-	PoolMisses         atomic.Uint64
-	MemoryPressure     atomic.Uint32 // 0-100
-	GCTriggered        atomic.Uint64
+	PoolAllocations   atomic.Uint64
+	PoolDeallocations atomic.Uint64
+	PoolHits          atomic.Uint64
+	PoolMisses        atomic.Uint64
+	MemoryPressure    atomic.Uint32 // 0-100
+	GCTriggered       atomic.Uint64
 }
 
 // SerializationMetrics tracks packet serialization performance
@@ -119,26 +119,26 @@ const (
 	MetricCategoryPaths
 	MetricCategoryPools
 	MetricCategorySerialization
-	MetricCategoryAll = MetricCategoryBasic | MetricCategoryLatency | MetricCategoryThroughput | 
-		MetricCategoryErrors | MetricCategoryOffload | MetricCategoryPaths | 
+	MetricCategoryAll = MetricCategoryBasic | MetricCategoryLatency | MetricCategoryThroughput |
+		MetricCategoryErrors | MetricCategoryOffload | MetricCategoryPaths |
 		MetricCategoryPools | MetricCategorySerialization
 )
 
 // NewScionPerformanceMonitor creates a new performance monitor
 func NewScionPerformanceMonitor() *ScionPerformanceMonitor {
 	monitor := &ScionPerformanceMonitor{
-		startTime:         time.Now(),
-		lastResetTime:     time.Now(),
+		startTime:           time.Now(),
+		lastResetTime:       time.Now(),
 		lastThroughputCheck: time.Now(),
-		samplingRate:      1.0, // Sample all events by default
-		enabledMetrics:    uint32(MetricCategoryAll),
+		samplingRate:        1.0, // Sample all events by default
+		enabledMetrics:      uint32(MetricCategoryAll),
 	}
-	
+
 	monitor.monitoringEnabled.Store(true)
-	
+
 	// Start background throughput calculator
 	go monitor.throughputCalculator()
-	
+
 	return monitor
 }
 
@@ -147,19 +147,19 @@ func (spm *ScionPerformanceMonitor) RecordTransmit(packetSize int, latency time.
 	if !spm.isEnabled(MetricCategoryBasic) {
 		return
 	}
-	
+
 	if !spm.shouldSample() {
 		return
 	}
-	
+
 	spm.packetsTransmitted.Add(1)
 	spm.bytesTransmitted.Add(uint64(packetSize))
-	
+
 	if spm.isEnabled(MetricCategoryLatency) && latency > 0 {
 		latencyNs := uint64(latency.Nanoseconds())
 		spm.txLatencySum.Add(latencyNs)
 		spm.txLatencyCount.Add(1)
-		
+
 		// Update max latency
 		for {
 			currentMax := spm.maxTxLatency.Load()
@@ -167,11 +167,11 @@ func (spm *ScionPerformanceMonitor) RecordTransmit(packetSize int, latency time.
 				break
 			}
 		}
-		
+
 		// Update latency bucket
 		spm.updateLatencyBucket(latency)
 	}
-	
+
 	if spm.isEnabled(MetricCategoryThroughput) {
 		spm.updateSizeBucket(packetSize)
 	}
@@ -182,19 +182,19 @@ func (spm *ScionPerformanceMonitor) RecordReceive(packetSize int, latency time.D
 	if !spm.isEnabled(MetricCategoryBasic) {
 		return
 	}
-	
+
 	if !spm.shouldSample() {
 		return
 	}
-	
+
 	spm.packetsReceived.Add(1)
 	spm.bytesReceived.Add(uint64(packetSize))
-	
+
 	if spm.isEnabled(MetricCategoryLatency) && latency > 0 {
 		latencyNs := uint64(latency.Nanoseconds())
 		spm.rxLatencySum.Add(latencyNs)
 		spm.rxLatencyCount.Add(1)
-		
+
 		// Update max latency
 		for {
 			currentMax := spm.maxRxLatency.Load()
@@ -210,7 +210,7 @@ func (spm *ScionPerformanceMonitor) RecordError(errorType ErrorType) {
 	if !spm.isEnabled(MetricCategoryErrors) {
 		return
 	}
-	
+
 	switch errorType {
 	case ErrorTypeTransmit:
 		spm.transmitErrors.Add(1)
@@ -238,7 +238,7 @@ func (spm *ScionPerformanceMonitor) RecordOffloadEvent(eventType OffloadEventTyp
 	if !spm.isEnabled(MetricCategoryOffload) {
 		return
 	}
-	
+
 	switch eventType {
 	case OffloadEventGSOAttempt:
 		spm.offloadMetrics.GSO_Attempts.Add(1)
@@ -278,7 +278,7 @@ func (spm *ScionPerformanceMonitor) RecordPathEvent(eventType PathEventType, dur
 	if !spm.isEnabled(MetricCategoryPaths) {
 		return
 	}
-	
+
 	switch eventType {
 	case PathEventLookup:
 		spm.pathMetrics.PathLookups.Add(1)
@@ -312,9 +312,9 @@ func (spm *ScionPerformanceMonitor) UpdatePoolMetrics(poolManager *OptimizedPool
 	if !spm.isEnabled(MetricCategoryPools) || poolManager == nil {
 		return
 	}
-	
+
 	allocs, deallocs, hits, misses, _, memPressure := poolManager.GetStats()
-	
+
 	spm.poolMetrics.PoolAllocations.Store(allocs)
 	spm.poolMetrics.PoolDeallocations.Store(deallocs)
 	spm.poolMetrics.PoolHits.Store(hits)
@@ -327,9 +327,9 @@ func (spm *ScionPerformanceMonitor) UpdateSerializationMetrics(serializer *Optim
 	if !spm.isEnabled(MetricCategorySerialization) || serializer == nil {
 		return
 	}
-	
+
 	_, hits, misses, _ := serializer.GetStats()
-	
+
 	spm.serializationMetrics.TemplateHits.Store(hits)
 	spm.serializationMetrics.TemplateMisses.Store(misses)
 }
@@ -352,7 +352,7 @@ func (spm *ScionPerformanceMonitor) shouldSample() bool {
 func (spm *ScionPerformanceMonitor) updateLatencyBucket(latency time.Duration) {
 	// Latency buckets: <1ms, 1-5ms, 5-10ms, 10-20ms, 20-50ms, 50-100ms, 100-200ms, 200-500ms, 500ms-1s, >1s
 	ms := latency.Milliseconds()
-	
+
 	var bucket int
 	switch {
 	case ms < 1:
@@ -376,7 +376,7 @@ func (spm *ScionPerformanceMonitor) updateLatencyBucket(latency time.Duration) {
 	default:
 		bucket = 9
 	}
-	
+
 	spm.latencyBuckets[bucket].Add(1)
 }
 
@@ -402,7 +402,7 @@ func (spm *ScionPerformanceMonitor) updateSizeBucket(size int) {
 	default:
 		bucket = 7
 	}
-	
+
 	spm.sizeBuckets[bucket].Add(1)
 }
 
@@ -410,25 +410,25 @@ func (spm *ScionPerformanceMonitor) updateSizeBucket(size int) {
 func (spm *ScionPerformanceMonitor) throughputCalculator() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-	
+
 	for range ticker.C {
 		if !spm.isEnabled(MetricCategoryThroughput) {
 			continue
 		}
-		
+
 		now := time.Now()
 		elapsed := now.Sub(spm.lastThroughputCheck).Seconds()
-		
+
 		if elapsed >= 1.0 {
 			currentTx := spm.packetsTransmitted.Load()
 			currentRx := spm.packetsReceived.Load()
-			
+
 			txThroughput := uint64(float64(currentTx-spm.prevTxPackets) / elapsed)
 			rxThroughput := uint64(float64(currentRx-spm.prevRxPackets) / elapsed)
-			
+
 			spm.currentTxThroughput.Store(txThroughput)
 			spm.currentRxThroughput.Store(rxThroughput)
-			
+
 			spm.prevTxPackets = currentTx
 			spm.prevRxPackets = currentRx
 			spm.lastThroughputCheck = now
@@ -438,37 +438,37 @@ func (spm *ScionPerformanceMonitor) throughputCalculator() {
 
 // PerformanceSnapshot represents a snapshot of performance metrics
 type PerformanceSnapshot struct {
-	Timestamp          time.Time `json:"timestamp"`
-	UptimeSeconds      float64   `json:"uptime_seconds"`
-	
+	Timestamp     time.Time `json:"timestamp"`
+	UptimeSeconds float64   `json:"uptime_seconds"`
+
 	// Basic metrics
-	PacketsTransmitted uint64    `json:"packets_transmitted"`
-	PacketsReceived    uint64    `json:"packets_received"`
-	BytesTransmitted   uint64    `json:"bytes_transmitted"`
-	BytesReceived      uint64    `json:"bytes_received"`
-	
+	PacketsTransmitted uint64 `json:"packets_transmitted"`
+	PacketsReceived    uint64 `json:"packets_received"`
+	BytesTransmitted   uint64 `json:"bytes_transmitted"`
+	BytesReceived      uint64 `json:"bytes_received"`
+
 	// Throughput
-	TxThroughputPPS    uint64    `json:"tx_throughput_pps"`
-	RxThroughputPPS    uint64    `json:"rx_throughput_pps"`
-	
+	TxThroughputPPS uint64 `json:"tx_throughput_pps"`
+	RxThroughputPPS uint64 `json:"rx_throughput_pps"`
+
 	// Latency
-	AvgTxLatencyMs     float64   `json:"avg_tx_latency_ms"`
-	AvgRxLatencyMs     float64   `json:"avg_rx_latency_ms"`
-	MaxTxLatencyMs     float64   `json:"max_tx_latency_ms"`
-	MaxRxLatencyMs     float64   `json:"max_rx_latency_ms"`
-	
+	AvgTxLatencyMs float64 `json:"avg_tx_latency_ms"`
+	AvgRxLatencyMs float64 `json:"avg_rx_latency_ms"`
+	MaxTxLatencyMs float64 `json:"max_tx_latency_ms"`
+	MaxRxLatencyMs float64 `json:"max_rx_latency_ms"`
+
 	// Errors
-	TransmitErrors     uint64    `json:"transmit_errors"`
-	ReceiveErrors      uint64    `json:"receive_errors"`
-	PathErrors         uint64    `json:"path_errors"`
-	SerializationErrors uint64   `json:"serialization_errors"`
-	
+	TransmitErrors      uint64 `json:"transmit_errors"`
+	ReceiveErrors       uint64 `json:"receive_errors"`
+	PathErrors          uint64 `json:"path_errors"`
+	SerializationErrors uint64 `json:"serialization_errors"`
+
 	// Component metrics
-	Offload            OffloadSnapshot       `json:"offload"`
-	Paths              PathPerformanceSnapshot          `json:"paths"`
-	Pools              PoolSnapshot          `json:"pools"`
-	Serialization      SerializationSnapshot `json:"serialization"`
-	
+	Offload       OffloadSnapshot         `json:"offload"`
+	Paths         PathPerformanceSnapshot `json:"paths"`
+	Pools         PoolSnapshot            `json:"pools"`
+	Serialization SerializationSnapshot   `json:"serialization"`
+
 	// Distribution data
 	LatencyDistribution [10]uint64 `json:"latency_distribution"`
 	SizeDistribution    [8]uint64  `json:"size_distribution"`
@@ -504,7 +504,7 @@ type SerializationSnapshot struct {
 // GetSnapshot returns a snapshot of current performance metrics
 func (spm *ScionPerformanceMonitor) GetSnapshot() PerformanceSnapshot {
 	now := time.Now()
-	
+
 	// Calculate averages
 	var avgTxLatency, avgRxLatency float64
 	if txCount := spm.txLatencyCount.Load(); txCount > 0 {
@@ -513,7 +513,7 @@ func (spm *ScionPerformanceMonitor) GetSnapshot() PerformanceSnapshot {
 	if rxCount := spm.rxLatencyCount.Load(); rxCount > 0 {
 		avgRxLatency = float64(spm.rxLatencySum.Load()) / float64(rxCount) / 1e6 // Convert to ms
 	}
-	
+
 	// Calculate rates
 	var gsoSuccessRate, groSuccessRate float64
 	if attempts := spm.offloadMetrics.GSO_Attempts.Load(); attempts > 0 {
@@ -522,27 +522,27 @@ func (spm *ScionPerformanceMonitor) GetSnapshot() PerformanceSnapshot {
 	if attempts := spm.offloadMetrics.GRO_Attempts.Load(); attempts > 0 {
 		groSuccessRate = float64(spm.offloadMetrics.GRO_Successes.Load()) / float64(attempts)
 	}
-	
+
 	var pathHitRate float64
 	if lookups := spm.pathMetrics.PathLookups.Load(); lookups > 0 {
 		pathHitRate = float64(spm.pathMetrics.PathCacheHits.Load()) / float64(lookups)
 	}
-	
+
 	var poolHitRate float64
 	if total := spm.poolMetrics.PoolHits.Load() + spm.poolMetrics.PoolMisses.Load(); total > 0 {
 		poolHitRate = float64(spm.poolMetrics.PoolHits.Load()) / float64(total)
 	}
-	
+
 	var templateHitRate float64
 	if total := spm.serializationMetrics.TemplateHits.Load() + spm.serializationMetrics.TemplateMisses.Load(); total > 0 {
 		templateHitRate = float64(spm.serializationMetrics.TemplateHits.Load()) / float64(total)
 	}
-	
+
 	var avgPathSelectionTime float64
 	if lookups := spm.pathMetrics.PathLookups.Load(); lookups > 0 {
 		avgPathSelectionTime = float64(spm.pathMetrics.PathSelectionTime.Load()) / float64(lookups) / 1e6 // Convert to ms
 	}
-	
+
 	// Copy distribution arrays
 	var latencyDist [10]uint64
 	var sizeDist [8]uint64
@@ -552,7 +552,7 @@ func (spm *ScionPerformanceMonitor) GetSnapshot() PerformanceSnapshot {
 	for i := 0; i < 8; i++ {
 		sizeDist[i] = spm.sizeBuckets[i].Load()
 	}
-	
+
 	return PerformanceSnapshot{
 		Timestamp:           now,
 		UptimeSeconds:       now.Sub(spm.startTime).Seconds(),
@@ -570,33 +570,33 @@ func (spm *ScionPerformanceMonitor) GetSnapshot() PerformanceSnapshot {
 		ReceiveErrors:       spm.receiveErrors.Load(),
 		PathErrors:          spm.pathErrors.Load(),
 		SerializationErrors: spm.serializationErrors.Load(),
-		
+
 		Offload: OffloadSnapshot{
 			GSOSuccessRate:  gsoSuccessRate,
 			GROSuccessRate:  groSuccessRate,
 			OffloadDisabled: spm.offloadMetrics.OffloadDisabled.Load(),
 			FallbackActive:  spm.offloadMetrics.FallbackActivated.Load(),
 		},
-		
+
 		Paths: PathPerformanceSnapshot{
 			CacheHitRate:       pathHitRate,
 			ActivePaths:        spm.pathMetrics.ActivePaths.Load(),
 			AvgSelectionTimeMs: avgPathSelectionTime,
 			PathFailures:       spm.pathMetrics.PathFailures.Load(),
 		},
-		
+
 		Pools: PoolSnapshot{
 			HitRate:        poolHitRate,
 			MemoryPressure: spm.poolMetrics.MemoryPressure.Load(),
 			GCTriggered:    spm.poolMetrics.GCTriggered.Load(),
 		},
-		
+
 		Serialization: SerializationSnapshot{
 			TemplateHitRate:    templateHitRate,
 			FastSerializations: spm.serializationMetrics.FastSerializations.Load(),
 			SlowSerializations: spm.serializationMetrics.SlowSerializations.Load(),
 		},
-		
+
 		LatencyDistribution: latencyDist,
 		SizeDistribution:    sizeDist,
 	}
@@ -616,31 +616,31 @@ func (spm *ScionPerformanceMonitor) GetSnapshotJSON() (string, error) {
 func (spm *ScionPerformanceMonitor) Reset() {
 	spm.mu.Lock()
 	defer spm.mu.Unlock()
-	
+
 	// Reset all atomic counters
 	spm.packetsTransmitted.Store(0)
 	spm.packetsReceived.Store(0)
 	spm.bytesTransmitted.Store(0)
 	spm.bytesReceived.Store(0)
-	
+
 	spm.transmitErrors.Store(0)
 	spm.receiveErrors.Store(0)
 	spm.pathErrors.Store(0)
 	spm.serializationErrors.Store(0)
-	
+
 	spm.txLatencySum.Store(0)
 	spm.rxLatencySum.Store(0)
 	spm.txLatencyCount.Store(0)
 	spm.rxLatencyCount.Store(0)
 	spm.maxTxLatency.Store(0)
 	spm.maxRxLatency.Store(0)
-	
+
 	// Reset component metrics
 	spm.resetOffloadMetrics()
 	spm.resetPathMetrics()
 	spm.resetPoolMetrics()
 	spm.resetSerializationMetrics()
-	
+
 	// Reset distribution buckets
 	for i := range spm.latencyBuckets {
 		spm.latencyBuckets[i].Store(0)
@@ -648,7 +648,7 @@ func (spm *ScionPerformanceMonitor) Reset() {
 	for i := range spm.sizeBuckets {
 		spm.sizeBuckets[i].Store(0)
 	}
-	
+
 	spm.lastResetTime = time.Now()
 	spm.prevTxPackets = 0
 	spm.prevRxPackets = 0

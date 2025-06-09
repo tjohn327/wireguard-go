@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/private/common"
@@ -83,6 +84,9 @@ type ScionBatchConn struct {
 	lastRxTime time.Time
 	txRetries  uint64
 	rxRetries  uint64
+
+	// Optimized SCION processing
+	optimizedConn *OptimizedSCIONConn
 }
 
 // ScionBatchConnConfig holds configuration options for ScionBatchConn
@@ -95,6 +99,8 @@ type ScionBatchConnConfig struct {
 	EnableIPv4TxOffload bool
 	// EnableIPv6TxOffload enables IPv6 transmit offloading (default: true)
 	EnableIPv6TxOffload bool
+	// EnableOptimizedDecoding enables fast SCION packet decoding (default: true)
+	EnableOptimizedDecoding bool
 }
 
 func NewScionBatchConn(
@@ -105,10 +111,11 @@ func NewScionBatchConn(
 	logger Logger,
 ) *ScionBatchConn {
 	return NewScionBatchConnWithConfig(conn, localIA, topology, pathManager, logger, ScionBatchConnConfig{
-		EnableIPv4TxOffload: false,
-		EnableIPv6TxOffload: false,
-		EnableIPv4RxOffload: false, // Now optimized for performance
-		EnableIPv6RxOffload: false, // Now optimized for performance
+		EnableIPv4TxOffload:     false,
+		EnableIPv6TxOffload:     false,
+		EnableIPv4RxOffload:     false,
+		EnableIPv6RxOffload:     false,
+		EnableOptimizedDecoding: false, // Enable fast SCION decoding
 	})
 }
 
@@ -178,6 +185,21 @@ func NewScionBatchConnWithConfig(
 		useOptimizedPools: true,
 	}
 
+	// Initialize optimized SCION processing if enabled
+	if config.EnableOptimizedDecoding {
+		logger.Verbosef("Creating complete optimized SCION connection...")
+		sbc.optimizedConn = NewOptimizedSCIONConn()
+		if sbc.optimizedConn != nil {
+			logger.Verbosef("Complete optimized SCION decoding enabled")
+		} else {
+			logger.Verbosef("Failed to create optimized SCION connection")
+		}
+	} else {
+		logger.Verbosef("Optimized SCION decoding disabled in config")
+	}
+
+	sbc.optimizedConn = nil
+
 	// Simple packet connection configuration - avoid adaptive overhead
 	if localAddr.IP.To4() != nil {
 		sbc.ipv4PC = ipv4.NewPacketConn(conn)
@@ -206,6 +228,8 @@ func NewScionBatchConnWithConfig(
 	if sbc.ipv4TxOffload || sbc.ipv6TxOffload {
 		sbc.fastSerialize = true
 	}
+	sbc.ipv4PC = nil
+	sbc.ipv6PC = nil
 
 	sbc.msgsPool = sync.Pool{
 		New: func() any {
@@ -318,11 +342,11 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 		s.mu.RUnlock()
 		return 0, ErrConnectionClosed
 	}
-
 	ipv4PC := s.ipv4PC
 	ipv6PC := s.ipv6PC
 	ipv4RxOffload := s.ipv4RxOffload
 	ipv6RxOffload := s.ipv6RxOffload
+	conn := s.conn
 	s.mu.RUnlock()
 
 	if ipv4PC == nil && ipv6PC == nil {
@@ -330,146 +354,135 @@ func (s *ScionBatchConn) ReadBatch(bufs [][]byte, sizes []int, eps []Endpoint) (
 		return s.readSingle(bufs[0], sizes, eps)
 	}
 
-	msgs := s.getMessages()
-	defer s.putMessages(msgs)
+	var br batchReader
+	var rxOffload bool
+	if ipv4PC != nil {
+		br = ipv4PC
+		rxOffload = ipv4RxOffload
+	} else {
+		br = ipv6PC
+		rxOffload = ipv6RxOffload
+	}
 
+	return s.receiveSCION(br, conn, rxOffload, bufs, sizes, eps)
+}
+
+func (s *ScionBatchConn) receiveSCION(
+	br batchReader,
+	conn *net.UDPConn,
+	rxOffload bool,
+	bufs [][]byte,
+	sizes []int,
+	eps []Endpoint,
+) (n int, err error) {
+	msgs := s.getMessages()
 	for i := range bufs {
 		(*msgs)[i].Buffers[0] = bufs[i]
 		(*msgs)[i].OOB = (*msgs)[i].OOB[:cap((*msgs)[i].OOB)]
 	}
-
-	// Read batch
+	defer s.putMessages(msgs)
 	var numMsgs int
-	var err error
-
-	if ipv4PC != nil {
-		if ipv4RxOffload {
+	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
+		if rxOffload {
 			readAt := len(*msgs) - (IdealBatchSize / udpSegmentMaxDatagrams)
-			if readAt < 0 {
-				readAt = 0
-			}
-			_, err = ipv4PC.ReadBatch((*msgs)[readAt:], 0)
+			numMsgs, err = br.ReadBatch((*msgs)[readAt:], 0)
 			if err != nil {
-				return 0, fmt.Errorf("IPv4 batch read failed: %w", err)
+				return 0, err
 			}
 			numMsgs, err = splitCoalescedMessages(*msgs, readAt, getGSOSize)
 			if err != nil {
-				return 0, fmt.Errorf("failed to split coalesced messages: %w", err)
+				return 0, err
 			}
 		} else {
-			numMsgs, err = ipv4PC.ReadBatch(*msgs, 0)
+			numMsgs, err = br.ReadBatch(*msgs, 0)
 			if err != nil {
-				return 0, fmt.Errorf("IPv4 batch read failed: %w", err)
+				return 0, err
 			}
 		}
 	} else {
-		if ipv6RxOffload {
-			readAt := len(*msgs) - (IdealBatchSize / udpSegmentMaxDatagrams)
-			if readAt < 0 {
-				readAt = 0
-			}
-			_, err = ipv6PC.ReadBatch((*msgs)[readAt:], 0)
-			if err != nil {
-				return 0, fmt.Errorf("IPv6 batch read failed: %w", err)
-			}
-			numMsgs, err = splitCoalescedMessages(*msgs, readAt, getGSOSize)
-			if err != nil {
-				return 0, fmt.Errorf("failed to split coalesced messages: %w", err)
-			}
-		} else {
-			numMsgs, err = ipv6PC.ReadBatch(*msgs, 0)
-			if err != nil {
-				return 0, fmt.Errorf("IPv6 batch read failed: %w", err)
-			}
+		msg := &(*msgs)[0]
+		msg.N, msg.NN, _, msg.Addr, err = conn.ReadMsgUDP(msg.Buffers[0], msg.OOB)
+		if err != nil {
+			return 0, err
 		}
+		numMsgs = 1
 	}
 
+	// Use optimized SCION processing if available
+	if s.optimizedConn != nil {
+		return s.fastReceiveSCION(msgs, numMsgs, bufs, sizes, eps)
+	}
+
+	// Fallback to standard processing
 	scionPkts := s.scionEmptyPktPool.Get().(*[]snet.Packet)
 	defer s.scionEmptyPktPool.Put(scionPkts)
 
-	// Efficient bounds check - single min calculation like StdNetBind
-	maxMsgs := numMsgs
-	if len(bufs) < maxMsgs {
-		maxMsgs = len(bufs)
-	}
-
-	// Optimized packet processing loop - reduce overhead for RX offload performance
-	for i := 0; i < maxMsgs; i++ {
+	for i := 0; i < numMsgs; i++ {
 		msg := &(*msgs)[i]
-		sizes[i] = 0 // Default to 0, only set on successful processing
-		
+		sizes[i] = 0
 		if msg.N == 0 {
 			continue
 		}
 
-		// SCION packet processing - minimize decode overhead
+		// SCION packet processing
 		scionPkt := &(*scionPkts)[i]
 		scionPkt.Bytes = msg.Buffers[0][:msg.N]
 
-		// Fast decode with minimal error handling
 		if err := scionPkt.Decode(); err != nil {
-			continue // Skip invalid SCION packets silently
+			continue
 		}
 
-		// Combined payload type checking - reduce type assertions
-		switch payload := scionPkt.Payload.(type) {
-		case snet.UDPPayload:
-			// Fast path for UDP packets
-			udp := payload
-			
-			// Streamlined reply path creation
-			rpath, ok := scionPkt.Path.(snet.RawPath)
-			if !ok {
-				continue
+		// Handle SCMP packets
+		if _, ok := scionPkt.Payload.(snet.SCMPPayload); ok {
+			s.mu.RLock()
+			handler := s.scmpHandler
+			s.mu.RUnlock()
+			if handler != nil {
+				handler.Handle(scionPkt)
 			}
-
-			replyPath, err := s.replyPather.ReplyPath(rpath)
-			if err != nil {
-				continue
-			}
-
-			// Direct address handling - skip intermediate allocations
-			nextHop := msg.Addr.(*net.UDPAddr)
-			
-			// Optimized endpoint creation using pool
-			ep := s.endpointPool.Get().(*ScionNetEndpoint)
-			
-			// Direct SCION address assignment
-			ep.scionAddr = &snet.UDPAddr{
-				IA: scionPkt.Source.IA,
-				Host: &net.UDPAddr{
-					IP:   scionPkt.Source.Host.IP().AsSlice(),
-					Port: int(udp.SrcPort),
-				},
-				Path:    replyPath,
-				NextHop: nextHop,
-			}
-
-			// Efficient address conversion - avoid complex logic
-			ep.StdNetEndpoint.AddrPort = nextHop.AddrPort()
-			eps[i] = ep
-
-			// Set source control - matches StdNetBind pattern
-			getSrcFromControl(msg.OOB[:msg.NN], &ep.StdNetEndpoint)
-
-			// Fast payload copy with single bounds check
-			payloadLen := len(udp.Payload)
-			if payloadLen <= len(bufs[i]) {
-				sizes[i] = payloadLen
-				copy(bufs[i], udp.Payload)
-			}
-			
-		case snet.SCMPPayload:
-			// Handle SCMP packets silently - no processing needed
 			continue
-			
-		default:
-			// Skip unknown payload types
+		}
+
+		// Extract UDP payload
+		udp, ok := scionPkt.Payload.(snet.UDPPayload)
+		if !ok {
 			continue
+		}
+
+		// Create reply path
+		rpath, ok := scionPkt.Path.(snet.RawPath)
+		if !ok {
+			continue
+		}
+		replyPath, err := s.replyPather.ReplyPath(rpath)
+		if err != nil {
+			continue
+		}
+
+		// Create endpoint
+		nextHop := msg.Addr.(*net.UDPAddr)
+		ep := s.endpointPool.Get().(*ScionNetEndpoint)
+		ep.scionAddr = &snet.UDPAddr{
+			IA: scionPkt.Source.IA,
+			Host: &net.UDPAddr{
+				IP:   scionPkt.Source.Host.IP().AsSlice(),
+				Port: int(udp.SrcPort),
+			},
+			Path:    replyPath,
+			NextHop: nextHop,
+		}
+		ep.StdNetEndpoint.AddrPort = nextHop.AddrPort()
+		getSrcFromControl(msg.OOB[:msg.NN], &ep.StdNetEndpoint)
+		eps[i] = ep
+
+		// Copy payload
+		payloadLen := len(udp.Payload)
+		if payloadLen <= len(bufs[i]) {
+			sizes[i] = payloadLen
+			copy(bufs[i], udp.Payload)
 		}
 	}
-
-	return maxMsgs, nil
+	return numMsgs, nil
 }
 
 // WriteBatch sends multiple SCION packets in a single syscall
@@ -824,4 +837,177 @@ func (s *ScionBatchConn) writeSingle(buf []byte, ep Endpoint) error {
 	}
 
 	return nil
+}
+
+// fastReceiveSCION performs complete optimized SCION packet processing
+func (s *ScionBatchConn) fastReceiveSCION(msgs *[]ipv6.Message, numMsgs int, bufs [][]byte, sizes []int, eps []Endpoint) (int, error) {
+	processedMsgs := 0
+	fastPathUsed := 0
+	fallbackUsed := 0
+
+	// Fallback pools in case optimized path fails
+	scionPkts := s.scionEmptyPktPool.Get().(*[]snet.Packet)
+	defer s.scionEmptyPktPool.Put(scionPkts)
+
+	for i := 0; i < numMsgs; i++ {
+		msg := &(*msgs)[i]
+		sizes[i] = 0
+		if msg.N == 0 {
+			continue
+		}
+
+		packetData := msg.Buffers[0][:msg.N]
+
+		if file, werr := DumpRawPacket("./scion-dumps", packetData); werr == nil {
+			s.logger.Verbosef("saved packet to %s", file)
+		} else {
+			s.logger.Verbosef("could not dump packet: %v", werr)
+		}
+
+		spkt := snet.Packet{}
+		spkt.Bytes = packetData
+		if err := spkt.Decode(); err != nil {
+			s.logger.Verbosef("Failed to decode SCION packet: %v", err)
+			continue
+		} else {
+			if file, werr := DumpSnetPacket("./scion-dumps", &spkt); werr == nil {
+				s.logger.Verbosef("saved packet to %s", file)
+			} else {
+				s.logger.Verbosef("could not dump packet: %v", werr)
+			}
+		}
+
+		// Try complete optimized SCION decoding
+		if s.optimizedConn != nil {
+			packetInfo, err := s.optimizedConn.FastDecodePacket(packetData)
+			if err != nil {
+				s.logger.Verbosef("FastDecode failed: %v", err)
+			} else if packetInfo == nil {
+				s.logger.Verbosef("FastDecode returned nil packetInfo")
+			} else if !packetInfo.IsValid {
+				s.logger.Verbosef("FastDecode returned invalid packetInfo")
+			}
+			if err == nil && packetInfo != nil && packetInfo.IsValid {
+				// Handle SCMP packets
+				if packetInfo.IsSCMP {
+					continue
+				}
+
+				// Fast path succeeded - create endpoint using optimized data
+				if packetInfo.PayloadLen > 0 {
+					// Extract payload using zero-copy method
+					payloadLen := s.optimizedConn.FastExtractPayload(packetInfo, bufs[i])
+					if payloadLen > 0 {
+						fastPathUsed++
+
+						// Create reply path using standard proven method
+						var replyPath snet.DataplanePath
+						if packetInfo.PathPtr != nil && packetInfo.PathLen > 0 {
+							// 1. Cast PathLen to int
+							in := unsafe.Slice(packetInfo.PathPtr, int(packetInfo.PathLen))
+
+							// 2. Make a copy because ReplyPath mutates the slice
+							pathCopy := append([]byte(nil), in...)
+
+							rawPath := snet.RawPath{
+								PathType: 1, // SCION path type
+								Raw:      pathCopy,
+							}
+
+							replyPath, err = s.replyPather.ReplyPath(rawPath)
+							if err != nil {
+								s.logger.Verbosef("Failed to create reply path: %v", err)
+								continue
+							}
+						}
+
+						// Create endpoint using all optimized packet info
+						nextHop := msg.Addr.(*net.UDPAddr)
+						ep := s.endpointPool.Get().(*ScionNetEndpoint)
+						ep.scionAddr = &snet.UDPAddr{
+							IA: packetInfo.SrcIA,
+							Host: &net.UDPAddr{
+								IP:   packetInfo.SrcHost.AsSlice(),
+								Port: int(packetInfo.SrcPort),
+							},
+							Path:    replyPath,
+							NextHop: nextHop,
+						}
+						ep.StdNetEndpoint.AddrPort = nextHop.AddrPort()
+						getSrcFromControl(msg.OOB[:msg.NN], &ep.StdNetEndpoint)
+						eps[i] = ep
+
+						sizes[i] = payloadLen
+						processedMsgs++
+						continue
+					}
+				}
+			}
+		}
+
+		// Fallback to standard SCION processing
+		fallbackUsed++
+		scionPkt := &(*scionPkts)[i]
+		scionPkt.Bytes = packetData
+
+		if err := scionPkt.Decode(); err != nil {
+			continue
+		}
+
+		// Handle SCMP packets
+		if _, ok := scionPkt.Payload.(snet.SCMPPayload); ok {
+			s.mu.RLock()
+			handler := s.scmpHandler
+			s.mu.RUnlock()
+			if handler != nil {
+				handler.Handle(scionPkt)
+			}
+			continue
+		}
+
+		// Extract UDP payload
+		udp, ok := scionPkt.Payload.(snet.UDPPayload)
+		if !ok {
+			continue
+		}
+
+		// Create reply path
+		rpath, ok := scionPkt.Path.(snet.RawPath)
+		if !ok {
+			continue
+		}
+		replyPath, err := s.replyPather.ReplyPath(rpath)
+		if err != nil {
+			continue
+		}
+
+		// Create endpoint using standard method
+		nextHop := msg.Addr.(*net.UDPAddr)
+		ep := s.endpointPool.Get().(*ScionNetEndpoint)
+		ep.scionAddr = &snet.UDPAddr{
+			IA: scionPkt.Source.IA,
+			Host: &net.UDPAddr{
+				IP:   scionPkt.Source.Host.IP().AsSlice(),
+				Port: int(udp.SrcPort),
+			},
+			Path:    replyPath,
+			NextHop: nextHop,
+		}
+		ep.StdNetEndpoint.AddrPort = nextHop.AddrPort()
+		getSrcFromControl(msg.OOB[:msg.NN], &ep.StdNetEndpoint)
+		eps[i] = ep
+
+		// Copy payload
+		payloadLen := len(udp.Payload)
+		if payloadLen <= len(bufs[i]) {
+			sizes[i] = payloadLen
+			copy(bufs[i], udp.Payload)
+		}
+		processedMsgs++
+	}
+
+	if fallbackUsed > 0 {
+		s.logger.Verbosef("Processed %d msgs: %d fast path, %d fallback", processedMsgs, fastPathUsed, fallbackUsed)
+	}
+	return processedMsgs, nil
 }

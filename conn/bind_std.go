@@ -251,6 +251,7 @@ func (s *StdNetBind) receiveIP(
 			}
 		} else {
 			numMsgs, err = br.ReadBatch(*msgs, 0)
+			
 			if err != nil {
 				return 0, err
 			}

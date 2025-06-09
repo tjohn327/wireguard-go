@@ -20,27 +20,27 @@ const (
 	SCIONCommonHeaderLen = 12
 	UDPHeaderLen         = 8
 	SCIONLineLen         = 4
-	MaxFlowID           = 0xfffff
-	
+	MaxFlowID            = 0xfffff
+
 	// Header field offsets
-	PayloadLenOffset    = 6
-	UDPLengthOffset     = 4
-	UDPChecksumOffset   = 6
-	
+	PayloadLenOffset  = 6
+	UDPLengthOffset   = 4
+	UDPChecksumOffset = 6
+
 	// Reserved field offsets in common header
-	ReservedField1      = 10
-	ReservedField2      = 11
-	
+	ReservedField1 = 10
+	ReservedField2 = 11
+
 	// Performance optimization constants
-	SIMDAlignment       = 32  // AVX2 alignment
-	CacheLineSize       = 64  // CPU cache line size  
-	VectorWidth         = 32  // AVX2 vector width
-	OptimalBatchSize    = 64  // Sweet spot for SIMD operations
-	ValidationBatchSize = 16  // Batch size for validation
-	
+	SIMDAlignment       = 32 // AVX2 alignment
+	CacheLineSize       = 64 // CPU cache line size
+	VectorWidth         = 32 // AVX2 vector width
+	OptimalBatchSize    = 64 // Sweet spot for SIMD operations
+	ValidationBatchSize = 16 // Batch size for validation
+
 	// SCION header size constraints (dynamic, not fixed)
-	MinSCIONHeaderSize  = SCIONCommonHeaderLen + 16 // Common header + minimal address header
-	MaxSCIONHeaderSize  = 1024 // Reasonable upper bound for most practical cases
+	MinSCIONHeaderSize = SCIONCommonHeaderLen + 16 // Common header + minimal address header
+	MaxSCIONHeaderSize = 1024                      // Reasonable upper bound for most practical cases
 )
 
 // PacketValidationError represents validation errors during packet processing
@@ -60,7 +60,7 @@ func (e *PacketValidationError) Error() string {
 // ensureCapacity validates that the buffer has sufficient capacity
 func ensureCapacity(buf []byte, needed int, context string) error {
 	if needed > cap(buf) {
-		return fmt.Errorf("%s: insufficient buffer capacity: need %d bytes, have %d", 
+		return fmt.Errorf("%s: insufficient buffer capacity: need %d bytes, have %d",
 			context, needed, cap(buf))
 	}
 	return nil
@@ -71,22 +71,22 @@ func validatePacketForSerialization(p *snet.Packet, index int) error {
 	if p == nil {
 		return &PacketValidationError{index, "packet", "packet is nil"}
 	}
-	
+
 	if p.Path == nil {
 		return &PacketValidationError{index, "path", "no path set"}
 	}
-	
+
 	udpPayload, ok := p.Payload.(snet.UDPPayload)
 	if !ok {
 		return &PacketValidationError{index, "payload", "payload is not UDPPayload"}
 	}
-	
+
 	if len(udpPayload.Payload) > 0xffff-UDPHeaderLen {
-		return &PacketValidationError{index, "payload", 
-			fmt.Sprintf("payload too large: %d bytes (max %d)", 
+		return &PacketValidationError{index, "payload",
+			fmt.Sprintf("payload too large: %d bytes (max %d)",
 				len(udpPayload.Payload), 0xffff-UDPHeaderLen)}
 	}
-	
+
 	return nil
 }
 
@@ -96,20 +96,20 @@ func computeFlowID(p *snet.Packet) uint32 {
 	if !ok {
 		return 1
 	}
-	
+
 	// High-performance hash using xxhash-inspired algorithm
 	const prime1 = 0x9E3779B1
 	const prime2 = 0x85EBCA77
-	
+
 	srcPort := uint32(udpPayload.SrcPort)
 	dstPort := uint32(udpPayload.DstPort)
-	
+
 	// Optimized hash computation with better distribution
 	hash := (srcPort*prime1 + dstPort*prime2) ^ (srcPort << 16)
 	hash = (hash ^ (hash >> 15)) * prime1
 	hash = (hash ^ (hash >> 13)) * prime2
 	hash = hash ^ (hash >> 16)
-	
+
 	return hash & MaxFlowID
 }
 
@@ -118,7 +118,7 @@ func fastMemcopyOptimized(dst, src []byte) {
 	if len(src) == 0 {
 		return
 	}
-	
+
 	// Use SIMD for large copies when available
 	if len(src) >= VectorWidth && runtime.GOARCH == "amd64" {
 		copyVectorized(dst, src)
@@ -133,23 +133,23 @@ func copyVectorized(dst, src []byte) {
 		copy(dst, src)
 		return
 	}
-	
+
 	// Process 32-byte chunks with vectorized operations
 	chunks := len(src) / VectorWidth
 	remainder := len(src) % VectorWidth
-	
+
 	// Vectorized copy using multiple uint64 operations
 	for i := 0; i < chunks; i++ {
 		srcOffset := i * VectorWidth
 		dstOffset := i * VectorWidth
-		
+
 		// Copy 32 bytes using 4x uint64 operations (simulates SIMD)
 		*(*uint64)(unsafe.Pointer(&dst[dstOffset])) = *(*uint64)(unsafe.Pointer(&src[srcOffset]))
 		*(*uint64)(unsafe.Pointer(&dst[dstOffset+8])) = *(*uint64)(unsafe.Pointer(&src[srcOffset+8]))
 		*(*uint64)(unsafe.Pointer(&dst[dstOffset+16])) = *(*uint64)(unsafe.Pointer(&src[srcOffset+16]))
 		*(*uint64)(unsafe.Pointer(&dst[dstOffset+24])) = *(*uint64)(unsafe.Pointer(&src[srcOffset+24]))
 	}
-	
+
 	// Handle remainder
 	if remainder > 0 {
 		copy(dst[chunks*VectorWidth:], src[chunks*VectorWidth:])
@@ -159,28 +159,28 @@ func copyVectorized(dst, src []byte) {
 // Batch validation with early termination for better cache performance
 func validatePacketBatchForSerialization(pkts []snet.Packet, startIdx int) error {
 	batchSize := min(ValidationBatchSize, len(pkts)-startIdx)
-	
+
 	for i := 0; i < batchSize; i++ {
 		idx := startIdx + i
 		p := &pkts[idx]
-		
+
 		if p == nil || p.Path == nil {
 			return &PacketValidationError{idx, "packet", "nil packet or path"}
 		}
-		
+
 		udpPayload, ok := p.Payload.(snet.UDPPayload)
 		if !ok {
 			return &PacketValidationError{idx, "payload", "not UDP payload"}
 		}
-		
+
 		if len(udpPayload.Payload) > 0xffff-UDPHeaderLen {
 			return &PacketValidationError{idx, "payload", "payload too large"}
 		}
-		
+
 		// Skip path length validation since SCION API doesn't expose Len() directly
 		// Path validation will happen during serialization
 	}
-	
+
 	return nil
 }
 
@@ -212,7 +212,7 @@ func Serialize(p *snet.Packet) error {
 	if err := validatePacketForSerialization(p, -1); err != nil {
 		return err
 	}
-	
+
 	// Keep the original semantics
 	p.Prepare()
 
@@ -246,7 +246,7 @@ func Serialize(p *snet.Packet) error {
 	if err := ensureCapacity(p.Bytes, totalLen, "packet serialization"); err != nil {
 		return err
 	}
-	
+
 	p.Bytes = p.Bytes[:totalLen]
 	buf := p.Bytes // alias for convenience
 
@@ -259,7 +259,7 @@ func Serialize(p *snet.Packet) error {
 	binary.BigEndian.PutUint16(buf[PayloadLenOffset:PayloadLenOffset+2], scion.PayloadLen)
 	buf[8] = byte(scion.PathType)
 	buf[9] = byte(scion.DstAddrType&0xf)<<4 | byte(scion.SrcAddrType&0xf)
-	
+
 	// Explicitly zero reserved fields
 	buf[ReservedField1] = 0
 	buf[ReservedField2] = 0
@@ -291,7 +291,7 @@ func Serialize(p *snet.Packet) error {
 	dstPort := udpPayload.DstPort
 	*(*uint16)(unsafe.Pointer(&buf[off])) = binary.BigEndian.Uint16((*(*[2]byte)(unsafe.Pointer(&srcPort)))[:])
 	*(*uint16)(unsafe.Pointer(&buf[off+2])) = binary.BigEndian.Uint16((*(*[2]byte)(unsafe.Pointer(&dstPort)))[:])
-	
+
 	if udpLen > 0xffff {
 		// jumbogram – encode 0 per RFC 2675 / SCION spec
 		*(*uint16)(unsafe.Pointer(&buf[off+UDPLengthOffset])) = 0
@@ -346,7 +346,7 @@ func SerializeBatch(pkts []snet.Packet, bufs [][]byte) error {
 			return err
 		}
 	}
-	
+
 	// 1. Serialize the first packet completely to serve as a template
 	firstPkt := &pkts[0]
 	if err := Serialize(firstPkt); err != nil {
@@ -372,7 +372,7 @@ func SerializeBatch(pkts []snet.Packet, bufs [][]byte) error {
 	// 2. Process remaining packets in optimized batches for SIMD efficiency
 	for i := 1; i < len(pkts); {
 		batchEnd := min(i+OptimalBatchSize, len(pkts))
-		
+
 		// Vectorized processing of batch
 		for j := i; j < batchEnd; j++ {
 			p := &pkts[j]
@@ -391,7 +391,7 @@ func SerializeBatch(pkts []snet.Packet, bufs [][]byte) error {
 
 			// Update SCION common header's PayloadLen field using direct memory access
 			currentUdpLenBE := uint16(currentUdpLen)
-			*(*uint16)(unsafe.Pointer(&p.Bytes[PayloadLenOffset])) = 
+			*(*uint16)(unsafe.Pointer(&p.Bytes[PayloadLenOffset])) =
 				binary.BigEndian.Uint16((*(*[2]byte)(unsafe.Pointer(&currentUdpLenBE)))[:])
 
 			// Copy UDP header template with SIMD
@@ -402,7 +402,7 @@ func SerializeBatch(pkts []snet.Packet, bufs [][]byte) error {
 			if currentUdpLen > 0xffff {
 				*(*uint16)(unsafe.Pointer(&p.Bytes[udpLenOffset])) = 0
 			} else {
-				*(*uint16)(unsafe.Pointer(&p.Bytes[udpLenOffset])) = 
+				*(*uint16)(unsafe.Pointer(&p.Bytes[udpLenOffset])) =
 					binary.BigEndian.Uint16((*(*[2]byte)(unsafe.Pointer(&currentUdpLenBE)))[:])
 			}
 
@@ -411,7 +411,7 @@ func SerializeBatch(pkts []snet.Packet, bufs [][]byte) error {
 
 			bufs[j] = p.Bytes
 		}
-		
+
 		i = batchEnd
 	}
 	return nil
@@ -422,13 +422,13 @@ func computeChecksumSIMD(data []byte) uint16 {
 	if len(data) == 0 {
 		return 0
 	}
-	
+
 	var sum uint32
-	
+
 	// Process 8-byte chunks for better performance (simulates SIMD operations)
 	chunks := len(data) / 8
 	remainder := len(data) % 8
-	
+
 	for i := 0; i < chunks; i++ {
 		offset := i * 8
 		// Process 4 uint16 values at once for better throughput
@@ -438,7 +438,7 @@ func computeChecksumSIMD(data []byte) uint16 {
 		v4 := binary.BigEndian.Uint16(data[offset+6:])
 		sum += uint32(v1) + uint32(v2) + uint32(v3) + uint32(v4)
 	}
-	
+
 	// Handle remainder
 	for i := chunks * 8; i < chunks*8+remainder; i += 2 {
 		if i+1 < len(data) {
@@ -447,12 +447,12 @@ func computeChecksumSIMD(data []byte) uint16 {
 			sum += uint32(data[i]) << 8
 		}
 	}
-	
+
 	// Fold 32-bit sum to 16 bits
 	for sum>>16 != 0 {
 		sum = (sum & 0xFFFF) + (sum >> 16)
 	}
-	
+
 	return ^uint16(sum)
 }
 
@@ -462,28 +462,28 @@ func SerializeBatchWithChecksums(pkts []snet.Packet, bufs [][]byte) error {
 	if err := SerializeBatch(pkts, bufs); err != nil {
 		return err
 	}
-	
+
 	// Then compute checksums efficiently for each packet
 	for i := range pkts {
 		udpPayload := pkts[i].Payload.(snet.UDPPayload) // Safe after SerializeBatch validation
 		udpLen := UDPHeaderLen + len(udpPayload.Payload)
-		
+
 		// Calculate dynamic SCION header length (varies per packet)
 		scHdrLen := len(pkts[i].Bytes) - udpLen
-		
+
 		// Validate header length is reasonable
 		if scHdrLen < MinSCIONHeaderSize || scHdrLen > MaxSCIONHeaderSize {
 			return fmt.Errorf("packet %d: invalid header length %d", i, scHdrLen)
 		}
-		
+
 		// Compute checksum for UDP header + payload using vectorized function
 		udpData := pkts[i].Bytes[scHdrLen:]
 		checksum := computeChecksumSIMD(udpData)
-		
+
 		// Write checksum back to packet using direct memory access
-		*(*uint16)(unsafe.Pointer(&pkts[i].Bytes[scHdrLen+UDPChecksumOffset])) = 
+		*(*uint16)(unsafe.Pointer(&pkts[i].Bytes[scHdrLen+UDPChecksumOffset])) =
 			binary.BigEndian.Uint16((*(*[2]byte)(unsafe.Pointer(&checksum)))[:])
 	}
-	
+
 	return nil
 }

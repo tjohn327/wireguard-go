@@ -19,18 +19,18 @@ import (
 
 // PathSnapshot represents an atomic snapshot of paths for all destinations
 type PathSnapshot struct {
-	version   uint64                        // Monotonically increasing version
-	timestamp time.Time                     // When this snapshot was created
-	pathCache map[addr.IA]*FastPathEntry    // Fast lookup cache
+	version   uint64                     // Monotonically increasing version
+	timestamp time.Time                  // When this snapshot was created
+	pathCache map[addr.IA]*FastPathEntry // Fast lookup cache
 }
 
 // FastPathEntry represents a lock-free path cache entry
 type FastPathEntry struct {
-	paths         []snet.Path  // All available paths
-	selectedIndex int          // Currently selected path index
-	isManual      bool         // Whether path was manually selected
-	lastUpdate    time.Time    // When paths were last updated
-	quality       PathQuality  // Cached path quality metrics
+	paths         []snet.Path // All available paths
+	selectedIndex int         // Currently selected path index
+	isManual      bool        // Whether path was manually selected
+	lastUpdate    time.Time   // When paths were last updated
+	quality       PathQuality // Cached path quality metrics
 }
 
 // PathQuality contains pre-computed path quality metrics for fast selection
@@ -45,35 +45,35 @@ type PathQuality struct {
 type LockFreePathManager struct {
 	// Atomic pointers for lock-free reads
 	currentSnapshot atomic.Pointer[PathSnapshot]
-	
+
 	// Background update management
-	updateWorker   *PathUpdateWorker
-	refreshTicker  *time.Ticker
-	shutdownCh     chan struct{}
-	
+	updateWorker  *PathUpdateWorker
+	refreshTicker *time.Ticker
+	shutdownCh    chan struct{}
+
 	// Configuration
-	localIA        addr.IA
-	daemonConn     daemon.Connector
-	policy         atomic.Value // PathPolicy
+	localIA         addr.IA
+	daemonConn      daemon.Connector
+	policy          atomic.Value // PathPolicy
 	refreshInterval time.Duration
-	
+
 	// Logging
 	logger Logger
-	
+
 	// Performance metrics
-	lookupCount    atomic.Uint64
-	updateCount    atomic.Uint64
-	cacheHits      atomic.Uint64
-	cacheMisses    atomic.Uint64
+	lookupCount atomic.Uint64
+	updateCount atomic.Uint64
+	cacheHits   atomic.Uint64
+	cacheMisses atomic.Uint64
 }
 
 // PathUpdateWorker handles background path updates without blocking reads
 type PathUpdateWorker struct {
-	manager       *LockFreePathManager
-	updateQueue   chan PathUpdateRequest
-	batchUpdates  map[addr.IA]PathUpdateRequest
-	batchTimer    *time.Timer
-	batchDelay    time.Duration
+	manager      *LockFreePathManager
+	updateQueue  chan PathUpdateRequest
+	batchUpdates map[addr.IA]PathUpdateRequest
+	batchTimer   *time.Timer
+	batchDelay   time.Duration
 }
 
 // PathUpdateRequest represents a request to update paths for a destination
@@ -102,10 +102,10 @@ func NewLockFreePathManager(daemonConn daemon.Connector, localIA addr.IA, policy
 		logger:          logger,
 		shutdownCh:      make(chan struct{}),
 	}
-	
+
 	// Set initial policy
 	lfpm.policy.Store(policy)
-	
+
 	// Initialize with empty snapshot
 	initialSnapshot := &PathSnapshot{
 		version:   1,
@@ -113,7 +113,7 @@ func NewLockFreePathManager(daemonConn daemon.Connector, localIA addr.IA, policy
 		pathCache: make(map[addr.IA]*FastPathEntry),
 	}
 	lfpm.currentSnapshot.Store(initialSnapshot)
-	
+
 	// Create update worker
 	lfpm.updateWorker = &PathUpdateWorker{
 		manager:      lfpm,
@@ -121,25 +121,25 @@ func NewLockFreePathManager(daemonConn daemon.Connector, localIA addr.IA, policy
 		batchUpdates: make(map[addr.IA]PathUpdateRequest),
 		batchDelay:   10 * time.Millisecond, // Batch updates for efficiency
 	}
-	
+
 	// Start background workers
 	go lfpm.updateWorker.run()
 	go lfpm.refreshWorker()
-	
+
 	return lfpm
 }
 
 // GetPathFast performs a lock-free path lookup with O(1) complexity
 func (lfpm *LockFreePathManager) GetPathFast(ia addr.IA) (snet.Path, bool) {
 	lfpm.lookupCount.Add(1)
-	
+
 	// Load current snapshot atomically
 	snapshot := lfpm.currentSnapshot.Load()
 	if snapshot == nil {
 		lfpm.cacheMisses.Add(1)
 		return nil, false
 	}
-	
+
 	// Fast lookup in snapshot
 	entry, exists := snapshot.pathCache[ia]
 	if !exists || len(entry.paths) == 0 {
@@ -148,16 +148,16 @@ func (lfpm *LockFreePathManager) GetPathFast(ia addr.IA) (snet.Path, bool) {
 		lfpm.requestPathUpdate(ia, UpdatePriorityNormal)
 		return nil, false
 	}
-	
+
 	lfpm.cacheHits.Add(1)
-	
+
 	// Validate selected index
 	if entry.selectedIndex < 0 || entry.selectedIndex >= len(entry.paths) {
-		lfpm.logger.Errorf("Invalid path index %d for IA %s (total paths: %d)", 
+		lfpm.logger.Errorf("Invalid path index %d for IA %s (total paths: %d)",
 			entry.selectedIndex, ia, len(entry.paths))
 		return nil, false
 	}
-	
+
 	return entry.paths[entry.selectedIndex], true
 }
 
@@ -170,7 +170,7 @@ func (lfpm *LockFreePathManager) RegisterDestinationFast(ia addr.IA) {
 			return // Already registered
 		}
 	}
-	
+
 	// Request immediate path update for new destination
 	lfpm.requestPathUpdate(ia, UpdatePriorityHigh)
 }
@@ -183,7 +183,7 @@ func (lfpm *LockFreePathManager) SetPathManual(ia addr.IA, pathIndex int) error 
 		priority:    UpdatePriorityImmediate,
 		timestamp:   time.Now(),
 	}
-	
+
 	// Add special handling for manual path selection
 	select {
 	case lfpm.updateWorker.updateQueue <- req:
@@ -200,7 +200,7 @@ func (lfpm *LockFreePathManager) requestPathUpdate(ia addr.IA, priority UpdatePr
 		priority:    priority,
 		timestamp:   time.Now(),
 	}
-	
+
 	select {
 	case lfpm.updateWorker.updateQueue <- req:
 		// Successfully queued
@@ -225,7 +225,7 @@ func (lfpm *LockFreePathManager) requestPathUpdate(ia addr.IA, priority UpdatePr
 func (lfpm *LockFreePathManager) refreshWorker() {
 	lfpm.refreshTicker = time.NewTicker(lfpm.refreshInterval)
 	defer lfpm.refreshTicker.Stop()
-	
+
 	for {
 		select {
 		case <-lfpm.refreshTicker.C:
@@ -242,7 +242,7 @@ func (lfpm *LockFreePathManager) triggerFullRefresh() {
 	if snapshot == nil {
 		return
 	}
-	
+
 	// Queue updates for all cached destinations
 	for ia := range snapshot.pathCache {
 		lfpm.requestPathUpdate(ia, UpdatePriorityLow)
@@ -253,15 +253,15 @@ func (lfpm *LockFreePathManager) triggerFullRefresh() {
 func (puw *PathUpdateWorker) run() {
 	puw.batchTimer = time.NewTimer(puw.batchDelay)
 	puw.batchTimer.Stop() // Don't start until we have updates
-	
+
 	for {
 		select {
 		case req := <-puw.updateQueue:
 			puw.handleUpdateRequest(req)
-			
+
 		case <-puw.batchTimer.C:
 			puw.processBatch()
-			
+
 		case <-puw.manager.shutdownCh:
 			return
 		}
@@ -275,14 +275,14 @@ func (puw *PathUpdateWorker) handleUpdateRequest(req PathUpdateRequest) {
 	if !exists || req.priority > existingReq.priority || req.timestamp.After(existingReq.timestamp) {
 		puw.batchUpdates[req.destination] = req
 	}
-	
+
 	// Handle immediate priority requests
 	if req.priority == UpdatePriorityImmediate {
 		puw.processImmediateUpdate(req)
 		delete(puw.batchUpdates, req.destination)
 		return
 	}
-	
+
 	// Start/restart batch timer for non-immediate requests
 	if !puw.batchTimer.Stop() {
 		select {
@@ -300,7 +300,7 @@ func (puw *PathUpdateWorker) processImmediateUpdate(req PathUpdateRequest) {
 		puw.manager.logger.Errorf("Immediate path update failed for %s: %v", req.destination, err)
 		return
 	}
-	
+
 	puw.updateSingleDestination(req.destination, paths)
 }
 
@@ -309,14 +309,14 @@ func (puw *PathUpdateWorker) processBatch() {
 	if len(puw.batchUpdates) == 0 {
 		return
 	}
-	
+
 	// Copy batch and clear for next round
 	batch := make(map[addr.IA]PathUpdateRequest, len(puw.batchUpdates))
 	for ia, req := range puw.batchUpdates {
 		batch[ia] = req
 		delete(puw.batchUpdates, ia)
 	}
-	
+
 	// Process batch efficiently
 	puw.processBatchUpdates(batch)
 }
@@ -329,21 +329,21 @@ func (puw *PathUpdateWorker) processBatchUpdates(batch map[addr.IA]PathUpdateReq
 		paths []snet.Path
 		err   error
 	}
-	
+
 	results := make(chan pathResult, len(batch))
 	semaphore := make(chan struct{}, runtime.NumCPU()*2) // Limit concurrency
-	
+
 	// Launch concurrent path fetches
 	for ia := range batch {
 		go func(destIA addr.IA) {
-			semaphore <- struct{}{} // Acquire
+			semaphore <- struct{}{}        // Acquire
 			defer func() { <-semaphore }() // Release
-			
+
 			paths, err := puw.fetchPaths(destIA)
 			results <- pathResult{ia: destIA, paths: paths, err: err}
 		}(ia)
 	}
-	
+
 	// Collect results and update snapshot
 	pathUpdates := make(map[addr.IA][]snet.Path)
 	for i := 0; i < len(batch); i++ {
@@ -354,7 +354,7 @@ func (puw *PathUpdateWorker) processBatchUpdates(batch map[addr.IA]PathUpdateReq
 		}
 		pathUpdates[result.ia] = result.paths
 	}
-	
+
 	// Update snapshot with all results atomically
 	if len(pathUpdates) > 0 {
 		puw.updateSnapshot(pathUpdates)
@@ -365,12 +365,12 @@ func (puw *PathUpdateWorker) processBatchUpdates(batch map[addr.IA]PathUpdateReq
 func (puw *PathUpdateWorker) fetchPaths(dest addr.IA) ([]snet.Path, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	
+
 	paths, err := puw.manager.daemonConn.Paths(ctx, dest, puw.manager.localIA, daemon.PathReqFlags{Refresh: true})
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return paths, nil
 }
 
@@ -385,33 +385,33 @@ func (puw *PathUpdateWorker) updateSnapshot(pathUpdates map[addr.IA][]snet.Path)
 	if len(pathUpdates) == 0 {
 		return
 	}
-	
+
 	for {
 		// Load current snapshot
 		currentSnapshot := puw.manager.currentSnapshot.Load()
 		if currentSnapshot == nil {
 			return
 		}
-		
+
 		// Create new snapshot
 		newSnapshot := &PathSnapshot{
 			version:   currentSnapshot.version + 1,
 			timestamp: time.Now(),
 			pathCache: make(map[addr.IA]*FastPathEntry, len(currentSnapshot.pathCache)+len(pathUpdates)),
 		}
-		
+
 		// Copy existing entries
 		for ia, entry := range currentSnapshot.pathCache {
 			newSnapshot.pathCache[ia] = entry
 		}
-		
+
 		// Add/update new entries
 		policy := puw.manager.policy.Load().(PathPolicy)
 		for ia, paths := range pathUpdates {
 			entry := puw.createFastPathEntry(paths, policy)
 			newSnapshot.pathCache[ia] = entry
 		}
-		
+
 		// Try to atomically swap the snapshot
 		if puw.manager.currentSnapshot.CompareAndSwap(currentSnapshot, newSnapshot) {
 			puw.manager.updateCount.Add(1)
@@ -431,16 +431,16 @@ func (puw *PathUpdateWorker) createFastPathEntry(paths []snet.Path, policy PathP
 			lastUpdate:    time.Now(),
 		}
 	}
-	
+
 	// Pre-compute quality metrics for fast selection
 	qualities := make([]PathQuality, len(paths))
 	for i, path := range paths {
 		qualities[i] = puw.computePathQuality(path)
 	}
-	
+
 	// Select best path based on policy
 	selectedIndex := puw.selectBestPath(paths, qualities, policy)
-	
+
 	return &FastPathEntry{
 		paths:         paths,
 		selectedIndex: selectedIndex,
@@ -461,7 +461,7 @@ func (puw *PathUpdateWorker) computePathQuality(path snet.Path) PathQuality {
 			reliability:    0.0,
 		}
 	}
-	
+
 	// Compute latency score
 	var totalLatency time.Duration
 	for _, l := range meta.Latency {
@@ -471,7 +471,7 @@ func (puw *PathUpdateWorker) computePathQuality(path snet.Path) PathQuality {
 		}
 		totalLatency += l
 	}
-	
+
 	// Compute bandwidth score (minimum bandwidth along the path)
 	var minBandwidth uint64 = ^uint64(0) // Max uint64
 	if len(meta.Bandwidth) > 0 {
@@ -484,10 +484,10 @@ func (puw *PathUpdateWorker) computePathQuality(path snet.Path) PathQuality {
 	} else {
 		minBandwidth = 0
 	}
-	
+
 	// Compute hop count
 	hopCount := len(meta.Interfaces)
-	
+
 	// Compute reliability (simplified: based on freshness and hop count)
 	age := time.Since(meta.Expiry)
 	reliability := 1.0
@@ -497,7 +497,7 @@ func (puw *PathUpdateWorker) computePathQuality(path snet.Path) PathQuality {
 	if hopCount > 5 {
 		reliability *= 0.8 // Reduce reliability for long paths
 	}
-	
+
 	return PathQuality{
 		latencyScore:   totalLatency,
 		bandwidthScore: minBandwidth,
@@ -511,9 +511,9 @@ func (puw *PathUpdateWorker) selectBestPath(paths []snet.Path, qualities []PathQ
 	if len(paths) == 0 {
 		return -1
 	}
-	
+
 	bestIndex := 0
-	
+
 	switch policy {
 	case PathPolicyShortest:
 		for i := 1; i < len(qualities); i++ {
@@ -521,28 +521,28 @@ func (puw *PathUpdateWorker) selectBestPath(paths []snet.Path, qualities []PathQ
 				bestIndex = i
 			}
 		}
-		
+
 	case PathPolicyBandwidth:
 		for i := 1; i < len(qualities); i++ {
 			if qualities[i].bandwidthScore > qualities[bestIndex].bandwidthScore {
 				bestIndex = i
 			}
 		}
-		
+
 	case PathPolicyLatency:
 		for i := 1; i < len(qualities); i++ {
 			if qualities[i].latencyScore < qualities[bestIndex].latencyScore {
 				bestIndex = i
 			}
 		}
-		
+
 	case PathPolicyFirst:
 		// Keep bestIndex = 0
-		
+
 	default:
 		// Default to first path
 	}
-	
+
 	return bestIndex
 }
 
@@ -560,11 +560,11 @@ func (lfpm *LockFreePathManager) GetStats() (lookups, updates, hits, misses uint
 	updates = lfpm.updateCount.Load()
 	hits = lfpm.cacheHits.Load()
 	misses = lfpm.cacheMisses.Load()
-	
+
 	if lookups > 0 {
 		hitRate = float64(hits) / float64(lookups)
 	}
-	
+
 	return
 }
 
