@@ -262,7 +262,7 @@ func (s *ScionNetBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 			)
 			s.batchConn.SetSCMPHandler(s.scionNetwork.SCMPHandler)
 			actualPort = uint16(s.batchConn.LocalAddr().(*net.UDPAddr).Port)
-			fns = append(fns, s.makeReceiveBatch())
+			fns = append(fns, s.makeReceiveSCION())
 			s.logger.Verbosef("SCION batch listener started on port %d", actualPort)
 		}
 	}
@@ -287,61 +287,62 @@ func (s *ScionNetBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 	return fns, actualPort, nil
 }
 
-func (s *ScionNetBind) makeReceiveBatch() ReceiveFunc {
+func (s *ScionNetBind) makeReceiveSCION() ReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
 		s.mu.Lock()
 		batchConn := s.batchConn
+		scionConn := s.scionConn
 		ipv4PC := s.batchConn.ipv4PC
 		ipv6PC := s.batchConn.ipv6PC
 		ipv4RxOffload := s.batchConn.ipv4RxOffload
 		ipv6RxOffload := s.batchConn.ipv6RxOffload
 		s.mu.Unlock()
 
-		if batchConn == nil {
-			return 0, net.ErrClosed
-		}
+		if batchConn != nil {
+		
 		return batchConn.ReadBatch(ipv4PC, ipv6PC, ipv4RxOffload, ipv6RxOffload, bufs, sizes, eps)
+		}
+
+		if scionConn != nil {
+			return s.receiveSCION(scionConn, bufs, sizes, eps)
+		}
+
+		return 0, fmt.Errorf("no suitable transport for endpoint")
 	}
 }
 
-func (s *ScionNetBind) makeReceiveSCION() ReceiveFunc {
-	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
-		s.mu.Lock()
-		scionConn := s.scionConn
-		s.mu.Unlock()
-
-		if scionConn == nil {
-			return 0, net.ErrClosed
-		}
-
-		// Read packet from SCION connection
-		buffer := bufs[0]
-		readBytes, remote, err := scionConn.ReadFrom(buffer)
-		if err != nil {
-			s.logger.Errorf("Error reading from SCION connection: %v", err)
-			return 0, err
-		}
-
-		sizes[0] = readBytes
-		// Convert net.Addr to our endpoint type
-		if scionAddr, ok := remote.(*snet.UDPAddr); ok {
-			addrPort := netip.AddrPortFrom(
-				netip.MustParseAddr(scionAddr.NextHop.IP.String()),
-				uint16(scionAddr.NextHop.Port),
-			)
-			eps[0] = &ScionNetEndpoint{
-				StdNetEndpoint: StdNetEndpoint{
-					AddrPort: addrPort,
-				},
-				scionAddr: scionAddr,
-			}
-		} else {
-			// Fallback if it's not a SCION address
-			return 0, fmt.Errorf("unexpected address type: %T", remote)
-		}
-
-		return 1, nil
+func (s *ScionNetBind) receiveSCION(scionConn *snet.Conn, bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
+	if scionConn == nil {
+		return 0, net.ErrClosed
 	}
+
+	// Read packet from SCION connection
+	buffer := bufs[0]
+	readBytes, remote, err := scionConn.ReadFrom(buffer)
+	if err != nil {
+		s.logger.Errorf("Error reading from SCION connection: %v", err)
+		return 0, err
+	}
+
+	sizes[0] = readBytes
+	// Convert net.Addr to our endpoint type
+	if scionAddr, ok := remote.(*snet.UDPAddr); ok {
+		addrPort := netip.AddrPortFrom(
+			netip.MustParseAddr(scionAddr.NextHop.IP.String()),
+			uint16(scionAddr.NextHop.Port),
+		)
+		eps[0] = &ScionNetEndpoint{
+			StdNetEndpoint: StdNetEndpoint{
+				AddrPort: addrPort,
+			},
+			scionAddr: scionAddr,
+		}
+	} else {
+		// Fallback if it's not a SCION address
+		return 0, fmt.Errorf("unexpected address type: %T", remote)
+	}
+
+	return 1, nil
 }
 
 func (s *ScionNetBind) Close() error {

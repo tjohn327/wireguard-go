@@ -265,12 +265,6 @@ func (s *ScionBatchConn) ReadBatch(
 	sizes []int,
 	eps []Endpoint,
 ) (int, error) {
-	s.mu.RLock()
-	if s.closed {
-		s.mu.RUnlock()
-		return 0, ErrConnectionClosed
-	}
-	s.mu.RUnlock()
 
 	if ipv4PC == nil && ipv6PC == nil {
 		// Fallback to single packet read
