@@ -259,17 +259,13 @@ func (s *ScionBatchConn) BatchSize() int {
 func (s *ScionBatchConn) ReadBatch(
 	ipv4PC *ipv4.PacketConn,
 	ipv6PC *ipv6.PacketConn,
+	scmpHandler snet.SCMPHandler,
 	ipv4RxOffload bool,
 	ipv6RxOffload bool,
 	bufs [][]byte,
 	sizes []int,
 	eps []Endpoint,
 ) (int, error) {
-
-	if ipv4PC == nil && ipv6PC == nil {
-		// Fallback to single packet read
-		return s.readSingle(bufs[0], sizes, eps)
-	}
 
 	msgs := s.getMessages()
 	defer s.putMessages(msgs)
@@ -346,12 +342,8 @@ func (s *ScionBatchConn) ReadBatch(
 
 		// Handle SCMP packets
 		if _, ok := scionPkt.Payload.(snet.SCMPPayload); ok {
-			s.mu.RLock()
-			handler := s.scmpHandler
-			s.mu.RUnlock()
-
-			if handler != nil {
-				if err := handler.Handle(&scionPkt); err != nil {
+			if scmpHandler != nil {
+				if err := scmpHandler.Handle(&scionPkt); err != nil {
 					s.logger.Verbosef("SCMP handler error: %v", err)
 				}
 			}
@@ -435,22 +427,6 @@ func (s *ScionBatchConn) WriteBatch(
 		return nil
 	}
 	fastSerialize := s.fastSerialize
-	s.mu.RLock()
-	if s.closed {
-		s.mu.RUnlock()
-		return ErrConnectionClosed
-	}
-	s.mu.RUnlock()
-
-	if ipv4PC == nil && ipv6PC == nil {
-		// Fallback to single packet writes
-		for _, buf := range bufs {
-			if err := s.writeSingle(buf, endpoint); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
 
 	scionEp, ok := endpoint.(*ScionNetEndpoint)
 	if !ok {
@@ -605,144 +581,5 @@ func (s *ScionBatchConn) sendv6(pc *ipv6.PacketConn, msgs []ipv6.Message) error 
 		}
 		start += n
 	}
-	return nil
-}
-
-// readSingle reads a single SCION packet (fallback for non-batch systems)
-func (s *ScionBatchConn) readSingle(buf []byte, sizes []int, eps []Endpoint) (int, error) {
-	s.mu.RLock()
-	if s.closed {
-		s.mu.RUnlock()
-		return 0, ErrConnectionClosed
-	}
-	conn := s.conn
-	s.mu.RUnlock()
-
-	pkt := s.scionSinglePktPool.Get().(*snet.Packet)
-	defer s.scionSinglePktPool.Put(pkt)
-
-	pkt.Bytes = snet.Bytes(buf)
-	n, remoteAddr, err := conn.ReadFrom(buf)
-	if err != nil {
-		return 0, fmt.Errorf("failed to read from connection: %w", err)
-	}
-
-	pkt.Bytes = pkt.Bytes[:n]
-	if err := pkt.Decode(); err != nil {
-		s.logger.Verbosef("Failed to decode SCION packet: %v", err)
-		return 0, ErrPacketDecode
-	}
-
-	// Handle SCMP packets
-	if _, ok := pkt.Payload.(snet.SCMPPayload); ok {
-		s.mu.RLock()
-		handler := s.scmpHandler
-		s.mu.RUnlock()
-
-		if handler != nil {
-			if err := handler.Handle(pkt); err != nil {
-				s.logger.Verbosef("SCMP handler error: %v", err)
-			}
-		}
-		return 0, nil // SCMP handled, no data to return
-	}
-
-	// Extract UDP payload
-	udp, ok := pkt.Payload.(snet.UDPPayload)
-	if !ok {
-		return 0, ErrNoUDPPayload
-	}
-
-	// Create reply path
-	rpath, ok := pkt.Path.(snet.RawPath)
-	if !ok {
-		return 0, ErrNoRawPath
-	}
-	replyPath, err := s.replyPather.ReplyPath(rpath)
-	if err != nil {
-		return 0, fmt.Errorf("failed to create reply path: %w", err)
-	}
-
-	// Safely extract remote address
-	nextHop, ok := remoteAddr.(*net.UDPAddr)
-	if !ok {
-		return 0, fmt.Errorf("%w: got %T", ErrInvalidAddressType, remoteAddr)
-	}
-
-	// Create endpoint
-	scionAddr := &snet.UDPAddr{
-		IA: pkt.Source.IA,
-		Host: &net.UDPAddr{
-			IP:   pkt.Source.Host.IP().AsSlice(),
-			Port: int(udp.SrcPort),
-		},
-		Path:    replyPath,
-		NextHop: nextHop,
-	}
-
-	eps[0] = &ScionNetEndpoint{
-		StdNetEndpoint: StdNetEndpoint{
-			AddrPort: netip.AddrPortFrom(
-				netip.MustParseAddr(scionAddr.NextHop.IP.String()),
-				uint16(scionAddr.NextHop.Port)),
-		},
-		scionAddr: scionAddr,
-	}
-
-	payloadLen := len(udp.Payload)
-	if payloadLen > len(buf) {
-		return 0, fmt.Errorf("UDP payload too large (%d bytes) for buffer (%d bytes)", payloadLen, len(buf))
-	}
-
-	sizes[0] = payloadLen
-	copy(buf, udp.Payload)
-
-	return 1, nil
-}
-
-// writeSingle writes a single SCION packet (fallback for non-batch systems)
-func (s *ScionBatchConn) writeSingle(buf []byte, ep Endpoint) error {
-	s.mu.RLock()
-	if s.closed {
-		s.mu.RUnlock()
-		return ErrConnectionClosed
-	}
-	conn := s.conn
-	s.mu.RUnlock()
-
-	scionEp, ok := ep.(*ScionNetEndpoint)
-	if !ok {
-		return ErrInvalidEndpointType
-	}
-
-	scionPkt := s.scionSinglePktPool.Get().(*snet.Packet)
-	defer s.scionSinglePktPool.Put(scionPkt)
-
-	scionPkt.PacketInfo = snet.PacketInfo{
-		Destination: snet.SCIONAddress{
-			IA:   scionEp.scionAddr.IA,
-			Host: addr.HostIP(netip.MustParseAddr(scionEp.scionAddr.Host.IP.String())),
-		},
-		Source: snet.SCIONAddress{
-			IA:   s.localIA,
-			Host: addr.HostIP(netip.MustParseAddr(s.localAddr.IP.String())),
-		},
-		Path: scionEp.scionAddr.Path,
-		Payload: snet.UDPPayload{
-			SrcPort: uint16(s.localAddr.Port),
-			DstPort: uint16(scionEp.scionAddr.Host.Port),
-			Payload: buf,
-		},
-	}
-
-	if err := scionPkt.Serialize(); err != nil {
-		return fmt.Errorf("failed to serialize SCION packet: %w", err)
-	}
-
-	_, err := conn.WriteTo(scionPkt.Bytes, scionEp.scionAddr.NextHop)
-	if err != nil {
-		return fmt.Errorf("failed to write packet: %w", err)
-	}
-
 	return nil
 }

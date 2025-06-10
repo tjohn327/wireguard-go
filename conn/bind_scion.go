@@ -260,7 +260,8 @@ func (s *ScionNetBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 				s.pathManager,
 				s.logger,
 			)
-			s.batchConn.SetSCMPHandler(s.scionNetwork.SCMPHandler)
+			scmpHandler := s.scionNetwork.SCMPHandler
+			s.batchConn.SetSCMPHandler(scmpHandler)
 			actualPort = uint16(s.batchConn.LocalAddr().(*net.UDPAddr).Port)
 			fns = append(fns, s.makeReceiveSCION())
 			s.logger.Verbosef("SCION batch listener started on port %d", actualPort)
@@ -296,11 +297,11 @@ func (s *ScionNetBind) makeReceiveSCION() ReceiveFunc {
 		ipv6PC := s.batchConn.ipv6PC
 		ipv4RxOffload := s.batchConn.ipv4RxOffload
 		ipv6RxOffload := s.batchConn.ipv6RxOffload
+		scmpHandler := s.batchConn.scmpHandler
 		s.mu.Unlock()
 
 		if batchConn != nil {
-		
-		return batchConn.ReadBatch(ipv4PC, ipv6PC, ipv4RxOffload, ipv6RxOffload, bufs, sizes, eps)
+			return batchConn.ReadBatch(ipv4PC, ipv6PC, scmpHandler, ipv4RxOffload, ipv6RxOffload, bufs, sizes, eps)
 		}
 
 		if scionConn != nil {
