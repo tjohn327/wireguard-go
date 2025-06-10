@@ -17,6 +17,8 @@ import (
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/daemon"
 	"github.com/scionproto/scion/pkg/snet"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 var (
@@ -25,27 +27,44 @@ var (
 
 // ScionNetBind implements Bind for SCION networks
 type ScionNetBind struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	logger Logger
 
 	// SCION network and connections
 	scionNetwork  *snet.SCIONNetwork
 	scionConn     *snet.Conn
-	batchConn     *ScionBatchConn // New batch connection
+	batchConn     *ScionBatchConn
 	localAddr     *net.UDPAddr
 	daemonService daemon.Service
 	daemonConn    daemon.Connector
 
 	// Path management
-	pathPolicy  PathPolicy
 	pathManager *PathManager
-	pathMu      sync.RWMutex
 
 	// Configuration
 	config *ScionConfig
 
 	// State
-	useBatch bool // Whether to use batch operations
+	useBatch bool
+
+	// Cached connection data for hot paths (accessed under mu)
+	cachedConnData *connData
+}
+
+// connData holds frequently accessed connection data to reduce lock contention
+type connData struct {
+	batchConn     *ScionBatchConn
+	scionConn     *snet.Conn
+	pathManager   *PathManager
+	useBatch      bool
+	// Batch connection fields
+	ipv4PC        *ipv4.PacketConn
+	ipv6PC        *ipv6.PacketConn
+	ipv4RxOffload bool
+	ipv6RxOffload bool
+	ipv4TxOffload bool
+	ipv6TxOffload bool
+	scmpHandler   snet.SCMPHandler
 }
 
 // ScionConfig holds SCION-specific configuration
@@ -120,9 +139,10 @@ func NewScionNetBind(config *ScionConfig, logger Logger) *ScionNetBind {
 	}
 
 	return &ScionNetBind{
-		config:   config,
-		logger:   logger,
-		useBatch: useBatch,
+		config:         config,
+		logger:         logger,
+		useBatch:       useBatch,
+		cachedConnData: &connData{},
 	}
 }
 
@@ -176,11 +196,27 @@ func (s *ScionNetBind) initSCION() error {
 		s.logger,
 		WithRefreshInterval(5*time.Minute),
 	)
-
-	s.pathPolicy = s.config.PathPolicy
 	s.logger.Verbosef("SCION network initialized with IA %s", s.config.LocalIA)
 
 	return nil
+}
+
+// updateCachedConnData updates the cached connection data under lock
+func (s *ScionNetBind) updateCachedConnData() {
+	s.cachedConnData.batchConn = s.batchConn
+	s.cachedConnData.scionConn = s.scionConn
+	s.cachedConnData.pathManager = s.pathManager
+	s.cachedConnData.useBatch = s.useBatch
+	
+	if s.batchConn != nil {
+		s.cachedConnData.ipv4PC = s.batchConn.ipv4PC
+		s.cachedConnData.ipv6PC = s.batchConn.ipv6PC
+		s.cachedConnData.ipv4RxOffload = s.batchConn.ipv4RxOffload
+		s.cachedConnData.ipv6RxOffload = s.batchConn.ipv6RxOffload
+		s.cachedConnData.ipv4TxOffload = s.batchConn.ipv4TxOffload
+		s.cachedConnData.ipv6TxOffload = s.batchConn.ipv6TxOffload
+		s.cachedConnData.scmpHandler = s.batchConn.scmpHandler
+	}
 }
 
 func (s *ScionNetBind) getUDPConn(localAddr *net.UDPAddr, port uint16) (*net.UDPConn, error) {
@@ -263,6 +299,10 @@ func (s *ScionNetBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 			scmpHandler := s.scionNetwork.SCMPHandler
 			s.batchConn.SetSCMPHandler(scmpHandler)
 			actualPort = uint16(s.batchConn.LocalAddr().(*net.UDPAddr).Port)
+			
+			// Update cached connection data
+			s.updateCachedConnData()
+			
 			fns = append(fns, s.makeReceiveSCION())
 			s.logger.Verbosef("SCION batch listener started on port %d", actualPort)
 		}
@@ -277,6 +317,10 @@ func (s *ScionNetBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 		}
 		s.scionConn = conn
 		actualPort = uint16(s.scionConn.LocalAddr().(*snet.UDPAddr).Host.Port)
+		
+		// Update cached connection data
+		s.updateCachedConnData()
+		
 		fns = append(fns, s.makeReceiveSCION())
 		s.logger.Verbosef("SCION listener started on port %d (non-batch)", actualPort)
 	}
@@ -290,22 +334,19 @@ func (s *ScionNetBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 
 func (s *ScionNetBind) makeReceiveSCION() ReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
-		s.mu.Lock()
-		batchConn := s.batchConn
-		scionConn := s.scionConn
-		ipv4PC := s.batchConn.ipv4PC
-		ipv6PC := s.batchConn.ipv6PC
-		ipv4RxOffload := s.batchConn.ipv4RxOffload
-		ipv6RxOffload := s.batchConn.ipv6RxOffload
-		scmpHandler := s.batchConn.scmpHandler
-		s.mu.Unlock()
+		s.mu.RLock()
+		connData := *s.cachedConnData // Copy struct to minimize lock time
+		s.mu.RUnlock()
 
-		if batchConn != nil {
-			return batchConn.ReadBatch(ipv4PC, ipv6PC, scmpHandler, ipv4RxOffload, ipv6RxOffload, bufs, sizes, eps)
+		if connData.batchConn != nil {
+			return connData.batchConn.ReadBatch(
+				connData.ipv4PC, connData.ipv6PC, connData.scmpHandler,
+				connData.ipv4RxOffload, connData.ipv6RxOffload,
+				bufs, sizes, eps)
 		}
 
-		if scionConn != nil {
-			return s.receiveSCION(scionConn, bufs, sizes, eps)
+		if connData.scionConn != nil {
+			return s.receiveSCION(connData.scionConn, bufs, sizes, eps)
 		}
 
 		return 0, fmt.Errorf("no suitable transport for endpoint")
@@ -328,10 +369,13 @@ func (s *ScionNetBind) receiveSCION(scionConn *snet.Conn, bufs [][]byte, sizes [
 	sizes[0] = readBytes
 	// Convert net.Addr to our endpoint type
 	if scionAddr, ok := remote.(*snet.UDPAddr); ok {
-		addrPort := netip.AddrPortFrom(
-			netip.MustParseAddr(scionAddr.NextHop.IP.String()),
-			uint16(scionAddr.NextHop.Port),
-		)
+		// Use optimized IP address conversion
+		addr, err := convertIPToAddr(scionAddr.NextHop.IP)
+		if err != nil {
+			return 0, fmt.Errorf("invalid IP address in SCION NextHop: %w", err)
+		}
+		
+		addrPort := netip.AddrPortFrom(addr, uint16(scionAddr.NextHop.Port))
 		eps[0] = &ScionNetEndpoint{
 			StdNetEndpoint: StdNetEndpoint{
 				AddrPort: addrPort,
@@ -350,18 +394,18 @@ func (s *ScionNetBind) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var errors []error
+	var firstErr error
 
 	if s.batchConn != nil {
-		if err := s.batchConn.Close(); err != nil {
-			errors = append(errors, fmt.Errorf("batch conn close: %w", err))
+		if err := s.batchConn.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("batch conn close: %w", err)
 		}
 		s.batchConn = nil
 	}
 
 	if s.scionConn != nil {
-		if err := s.scionConn.Close(); err != nil {
-			errors = append(errors, fmt.Errorf("scion conn close: %w", err))
+		if err := s.scionConn.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("scion conn close: %w", err)
 		}
 		s.scionConn = nil
 	}
@@ -372,17 +416,16 @@ func (s *ScionNetBind) Close() error {
 	}
 
 	if s.daemonConn != nil {
-		if err := s.daemonConn.Close(); err != nil {
-			errors = append(errors, fmt.Errorf("daemon conn close: %w", err))
+		if err := s.daemonConn.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("daemon conn close: %w", err)
 		}
 		s.daemonConn = nil
 	}
 
-	// Return first error if any
-	if len(errors) > 0 {
-		return errors[0]
-	}
-	return nil
+	// Clear cached data
+	s.cachedConnData = &connData{}
+
+	return firstErr
 }
 
 func (s *ScionNetBind) SetMark(mark uint32) error {
@@ -396,33 +439,29 @@ func (s *ScionNetBind) Send(bufs [][]byte, ep Endpoint) error {
 		return ErrWrongEndpointType
 	}
 
-	s.mu.Lock()
-	pathManager := s.pathManager
-	batchConn := s.batchConn
-	scionConn := s.scionConn
-	ipv4PC := s.batchConn.ipv4PC
-	ipv6PC := s.batchConn.ipv6PC
-	ipv4TxOffload := s.batchConn.ipv4TxOffload
-	ipv6TxOffload := s.batchConn.ipv6TxOffload
-	useBatch := s.useBatch
-	s.mu.Unlock()
+	s.mu.RLock()
+	connData := *s.cachedConnData // Copy struct to minimize lock time
+	s.mu.RUnlock()
 
 	// Update path if path manager is available
-	if pathManager != nil {
-		if p, err := pathManager.GetPath(scionEp.scionAddr.IA); err == nil {
+	if connData.pathManager != nil {
+		if p, err := connData.pathManager.GetPath(scionEp.scionAddr.IA); err == nil {
 			scionEp.scionAddr.Path = p.Dataplane()
 			scionEp.scionAddr.NextHop = p.UnderlayNextHop()
 		}
 	}
 
 	// Use batch connection if available
-	if batchConn != nil && useBatch {
-		return batchConn.WriteBatch(ipv4PC, ipv6PC, ipv4TxOffload, ipv6TxOffload, bufs, scionEp)
+	if connData.batchConn != nil && connData.useBatch {
+		return connData.batchConn.WriteBatch(
+			connData.ipv4PC, connData.ipv6PC,
+			connData.ipv4TxOffload, connData.ipv6TxOffload,
+			bufs, scionEp)
 	}
 
 	// Fallback to regular SCION connection
-	if scionConn != nil {
-		return s.sendSCION(bufs, scionEp, scionConn)
+	if connData.scionConn != nil {
+		return s.sendSCION(bufs, scionEp, connData.scionConn)
 	}
 
 	return fmt.Errorf("no suitable transport for endpoint")
@@ -450,19 +489,21 @@ func (s *ScionNetBind) ParseEndpoint(str string) (Endpoint, error) {
 			scionAddr: scionAddr,
 		}
 
-		s.mu.Lock()
-		pathManager := s.pathManager
-		s.mu.Unlock()
+		s.mu.RLock()
+		pathManager := s.cachedConnData.pathManager
+		s.mu.RUnlock()
 
 		if pathManager != nil {
 			pathManager.RegisterEndpoint(scionAddr.IA)
 			if p, err := pathManager.GetPath(scionAddr.IA); err == nil {
 				scionAddr.Path = p.Dataplane()
 				scionAddr.NextHop = p.UnderlayNextHop()
+				
+				// Use optimized IP address conversion
+				addr, _ := convertIPToAddr(scionAddr.NextHop.IP)
+				
 				scionEndpoint.StdNetEndpoint.AddrPort = netip.AddrPortFrom(
-					netip.MustParseAddr(scionAddr.NextHop.IP.String()),
-					uint16(scionAddr.NextHop.Port),
-				)
+					addr, uint16(scionAddr.NextHop.Port))
 			}
 		}
 		return scionEndpoint, nil
@@ -472,25 +513,21 @@ func (s *ScionNetBind) ParseEndpoint(str string) (Endpoint, error) {
 }
 
 func (s *ScionNetBind) BatchSize() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	batchConn := s.cachedConnData.batchConn
+	s.mu.RUnlock()
 
-	if s.batchConn != nil {
-		return s.batchConn.BatchSize()
+	if batchConn != nil {
+		return batchConn.BatchSize()
 	}
 	return 1 // SCION typically processes one packet at a time
 }
 
 // Path management methods
 func (s *ScionNetBind) SetPathPolicy(policy string) {
-	s.pathMu.Lock()
-	defer s.pathMu.Unlock()
-
-	s.pathPolicy = ParsePathPolicy(policy)
-
-	s.mu.Lock()
-	pathManager := s.pathManager
-	s.mu.Unlock()
+	s.mu.RLock()
+	pathManager := s.cachedConnData.pathManager
+	s.mu.RUnlock()
 
 	if pathManager != nil {
 		pathManager.SetPolicy(policy)
@@ -504,18 +541,30 @@ func (e *ScionNetEndpoint) GetScionAddr() *snet.UDPAddr {
 func (e *ScionNetEndpoint) SetScionAndIPAddresses(scionAddr *snet.UDPAddr) {
 	e.scionAddr = scionAddr
 	if scionAddr != nil && scionAddr.NextHop != nil {
-		e.StdNetEndpoint.AddrPort = netip.AddrPortFrom(
-			netip.MustParseAddr(scionAddr.NextHop.IP.String()),
-			uint16(scionAddr.NextHop.Port),
-		)
+		// Use optimized IP address conversion
+		if addr, err := convertIPToAddr(scionAddr.NextHop.IP); err == nil {
+			e.StdNetEndpoint.AddrPort = netip.AddrPortFrom(
+				addr, uint16(scionAddr.NextHop.Port))
+		}
 	}
+}
+
+// convertIPToAddr efficiently converts net.IP to netip.Addr without string parsing
+func convertIPToAddr(ip net.IP) (netip.Addr, error) {
+	if ip4 := ip.To4(); ip4 != nil {
+		return netip.AddrFrom4([4]byte{ip4[0], ip4[1], ip4[2], ip4[3]}), nil
+	}
+	if ip16 := ip.To16(); ip16 != nil {
+		return netip.AddrFrom16([16]byte(ip16)), nil
+	}
+	return netip.Addr{}, fmt.Errorf("invalid IP address")
 }
 
 // GetPathsJSON returns a JSON string containing available paths for the given IA
 func (bind *ScionNetBind) GetPathsJSON(iaStr string) (string, error) {
-	bind.mu.Lock()
-	pathManager := bind.pathManager
-	bind.mu.Unlock()
+	bind.mu.RLock()
+	pathManager := bind.cachedConnData.pathManager
+	bind.mu.RUnlock()
 
 	if pathManager == nil {
 		return "", fmt.Errorf("path manager not initialized")
@@ -525,9 +574,9 @@ func (bind *ScionNetBind) GetPathsJSON(iaStr string) (string, error) {
 
 // SetPath sets a specific path for a destination IA
 func (bind *ScionNetBind) SetPath(iaStr string, pathIndex int) error {
-	bind.mu.Lock()
-	pathManager := bind.pathManager
-	bind.mu.Unlock()
+	bind.mu.RLock()
+	pathManager := bind.cachedConnData.pathManager
+	bind.mu.RUnlock()
 
 	if pathManager == nil {
 		return fmt.Errorf("path manager not initialized")
@@ -537,9 +586,9 @@ func (bind *ScionNetBind) SetPath(iaStr string, pathIndex int) error {
 
 // GetPathPolicy returns the current path selection policy
 func (bind *ScionNetBind) GetPathPolicy() string {
-	bind.mu.Lock()
-	pathManager := bind.pathManager
-	bind.mu.Unlock()
+	bind.mu.RLock()
+	pathManager := bind.cachedConnData.pathManager
+	bind.mu.RUnlock()
 
 	if pathManager == nil {
 		return "unknown"

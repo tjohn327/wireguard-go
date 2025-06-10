@@ -44,7 +44,7 @@ func LoadScionConfigFromEnv() (*ScionConfig, error) {
 	if policy := os.Getenv(EnvSCIONPathPolicy); policy != "" {
 		config.PathPolicy = ParsePathPolicy(policy)
 	}
-	
+
 	// Try to get SCION address from scion command first, then fallback to environment
 	scionAddress := GetScionAddress()
 	if scionAddress == "" {

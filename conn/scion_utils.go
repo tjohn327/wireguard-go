@@ -17,16 +17,16 @@ const (
 	SCIONCommonHeaderLen = 12
 	UDPHeaderLen         = 8
 	SCIONLineLen         = 4
-	MaxFlowID           = 0xfffff
-	
+	MaxFlowID            = 0xfffff
+
 	// Header field offsets
-	PayloadLenOffset    = 6
-	UDPLengthOffset     = 4
-	UDPChecksumOffset   = 6
-	
+	PayloadLenOffset  = 6
+	UDPLengthOffset   = 4
+	UDPChecksumOffset = 6
+
 	// Reserved field offsets in common header
-	ReservedField1      = 10
-	ReservedField2      = 11
+	ReservedField1 = 10
+	ReservedField2 = 11
 )
 
 // PacketValidationError represents validation errors during packet processing
@@ -46,7 +46,7 @@ func (e *PacketValidationError) Error() string {
 // ensureCapacity validates that the buffer has sufficient capacity
 func ensureCapacity(buf []byte, needed int, context string) error {
 	if needed > cap(buf) {
-		return fmt.Errorf("%s: insufficient buffer capacity: need %d bytes, have %d", 
+		return fmt.Errorf("%s: insufficient buffer capacity: need %d bytes, have %d",
 			context, needed, cap(buf))
 	}
 	return nil
@@ -57,22 +57,22 @@ func validatePacketForSerialization(p *snet.Packet, index int) error {
 	if p == nil {
 		return &PacketValidationError{index, "packet", "packet is nil"}
 	}
-	
+
 	if p.Path == nil {
 		return &PacketValidationError{index, "path", "no path set"}
 	}
-	
+
 	udpPayload, ok := p.Payload.(snet.UDPPayload)
 	if !ok {
 		return &PacketValidationError{index, "payload", "payload is not UDPPayload"}
 	}
-	
+
 	if len(udpPayload.Payload) > 0xffff-UDPHeaderLen {
-		return &PacketValidationError{index, "payload", 
-			fmt.Sprintf("payload too large: %d bytes (max %d)", 
+		return &PacketValidationError{index, "payload",
+			fmt.Sprintf("payload too large: %d bytes (max %d)",
 				len(udpPayload.Payload), 0xffff-UDPHeaderLen)}
 	}
-	
+
 	return nil
 }
 
@@ -84,7 +84,7 @@ func computeFlowID(p *snet.Packet) uint32 {
 	if !ok {
 		return 1
 	}
-	
+
 	// Simple hash combining src and dst ports
 	hash := uint32(udpPayload.SrcPort)<<16 | uint32(udpPayload.DstPort)
 	return hash & MaxFlowID
@@ -110,7 +110,7 @@ func Serialize(p *snet.Packet) error {
 	if err := validatePacketForSerialization(p, -1); err != nil {
 		return err
 	}
-	
+
 	// Keep the original semantics
 	p.Prepare()
 
@@ -144,7 +144,7 @@ func Serialize(p *snet.Packet) error {
 	if err := ensureCapacity(p.Bytes, totalLen, "packet serialization"); err != nil {
 		return err
 	}
-	
+
 	p.Bytes = p.Bytes[:totalLen]
 	buf := p.Bytes // alias for convenience
 
@@ -157,7 +157,7 @@ func Serialize(p *snet.Packet) error {
 	binary.BigEndian.PutUint16(buf[PayloadLenOffset:PayloadLenOffset+2], scion.PayloadLen)
 	buf[8] = byte(scion.PathType)
 	buf[9] = byte(scion.DstAddrType&0xf)<<4 | byte(scion.SrcAddrType&0xf)
-	
+
 	// Explicitly zero reserved fields
 	buf[ReservedField1] = 0
 	buf[ReservedField2] = 0
@@ -234,7 +234,7 @@ func SerializeBatch(pkts []snet.Packet, bufs [][]byte) error {
 			return err
 		}
 	}
-	
+
 	// 1. Serialize the first packet completely to serve as a template
 	firstPkt := &pkts[0]
 	if err := Serialize(firstPkt); err != nil {
