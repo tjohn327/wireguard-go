@@ -397,7 +397,7 @@ func (s *ScionNetBind) Close() error {
 	var firstErr error
 
 	if s.batchConn != nil {
-		if err := s.batchConn.Close(); err != nil && firstErr == nil {
+		if err := s.batchConn.Close(); err != nil {
 			firstErr = fmt.Errorf("batch conn close: %w", err)
 		}
 		s.batchConn = nil

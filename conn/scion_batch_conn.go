@@ -32,6 +32,8 @@ var (
 	ErrNoRawPath           = errors.New("packet does not contain raw path")
 )
 
+var fastSerializer *FastSnetSerializer = NewFastSnetSerializer()
+
 // ScionBatchConn provides batch send/receive capabilities for SCION packets
 type ScionBatchConn struct {
 	mu          sync.RWMutex
@@ -79,6 +81,8 @@ type ScionBatchConnConfig struct {
 	EnableIPv4TxOffload bool
 	// EnableIPv6TxOffload enables IPv6 transmit offloading (default: true)
 	EnableIPv6TxOffload bool
+	// EnableFastSerialize enables fast serialization (default: false)
+	EnableFastSerialize bool
 }
 
 func NewScionBatchConn(
@@ -93,6 +97,7 @@ func NewScionBatchConn(
 		EnableIPv6TxOffload: false,
 		EnableIPv4RxOffload: false, // Disabled by default due to stability concerns
 		EnableIPv6RxOffload: false, // Disabled by default due to stability concerns
+		EnableFastSerialize: true,
 	})
 }
 
@@ -180,8 +185,7 @@ func (s *ScionBatchConn) configureNetworking(config ScionBatchConnConfig) {
 	} else {
 		s.configureIPv6(config)
 	}
-
-	if s.ipv4TxOffload || s.ipv6TxOffload {
+	if config.EnableFastSerialize {
 		s.fastSerialize = true
 	}
 }
