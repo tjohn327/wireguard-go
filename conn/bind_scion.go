@@ -21,6 +21,13 @@ import (
 	"github.com/scionproto/scion/pkg/snet"
 )
 
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 var (
 	_ Bind = (*ScionNetBind)(nil)
 )
@@ -31,9 +38,9 @@ type ScionNetBind struct {
 	logger Logger
 
 	// SCION network and connections - protected by atomic operations for lock-free access
-	scionNetwork  atomic.Pointer[fastsnet.FastSCIONNetwork]
-	scionConn     atomic.Pointer[fastsnet.FastSCIONPacketConn]
-	
+	scionNetwork atomic.Pointer[fastsnet.FastSCIONNetwork]
+	scionConn    atomic.Pointer[fastsnet.FastSCIONPacketConn]
+
 	localAddr     *net.UDPAddr
 	daemonService daemon.Service
 	daemonConn    daemon.Connector
@@ -164,7 +171,7 @@ func (s *ScionNetBind) initSCION() error {
 
 	batchSize := 1
 	if s.useBatch {
-		batchSize = IdealBatchSize
+		batchSize = 32
 	}
 
 	// Initialize SCION network with proper topology
@@ -263,7 +270,7 @@ func (s *ScionNetBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 	if scionNet == nil {
 		return nil, 0, fmt.Errorf("SCION network not initialized")
 	}
-	
+
 	conn := fastsnet.NewFastSCIONPacketConn(udpConn, scionNet.Topology,
 		scionNet.BatchSize)
 	s.scionConn.Store(conn)
@@ -301,26 +308,81 @@ func (s *ScionNetBind) receiveBatchSCION(conn *fastsnet.FastSCIONPacketConn,
 		return 0, net.ErrClosed
 	}
 
+	// // Under high load, add a small delay to prevent buffer exhaustion
+	// if runtime.GOOS == "linux" && len(bufs) > 16 {
+	// 	runtime.Gosched() // Yield to let other goroutines process
+	// }
+
 	readSizes, addrs, err := conn.ReadBatchFrom(bufs)
 	if err != nil {
 		return 0, err
 	}
 
-	for i, size := range readSizes {
-		sizes[i] = size
+	// Ensure we have matching lengths for all arrays
+	maxCount := min(len(readSizes), len(bufs))
+	maxCount = min(maxCount, len(addrs))
+
+	// CRITICAL: Clear buffers beyond valid data to prevent stale data issues
+	// WireGuard reuses buffers without clearing, so we need to ensure
+	// no stale data remains after the valid payload
+	for i := 0; i < maxCount; i++ {
+		if readSizes[i] > 0 && readSizes[i] < len(bufs[i]) {
+			// Clear the buffer beyond the valid data
+			for j := readSizes[i]; j < len(bufs[i]); j++ {
+				bufs[i][j] = 0
+			}
+		}
+	}
+
+	validPackets := 0
+	for i := 0; i < maxCount; i++ {
+		// Skip packets that are too small to be valid WireGuard messages
+		// MinMessageSize is 32 bytes (MessageTransportHeaderSize + poly1305.TagSize)
+		if readSizes[i] < 32 {
+			continue
+		}
+
+		// Skip packets with invalid addresses
 		addr, err := convertIPToAddr(addrs[i].NextHop.IP)
 		if err != nil {
-			return 0, fmt.Errorf("invalid IP address in SCION NextHop: %w", err)
+			// Log but continue processing other packets
+			if os.Getenv("DEBUG_SCION") == "1" {
+				s.logger.Verbosef("Skipping packet %d: invalid IP address: %v", i, err)
+			}
+			continue
 		}
+
+		// Safety check: ensure packet size doesn't exceed buffer capacity
+		if readSizes[i] > len(bufs[i]) {
+			if os.Getenv("DEBUG_SCION") == "1" {
+				s.logger.Verbosef("Skipping packet %d: size %d exceeds buffer capacity %d", i, readSizes[i], len(bufs[i]))
+			}
+			continue
+		}
+
+		// Only process valid packets - compact array if needed
+		if validPackets != i {
+			// Move valid packet data to compact position
+			copy(bufs[validPackets], bufs[i][:readSizes[i]])
+		}
+
+		sizes[validPackets] = readSizes[i]
 		addrPort := netip.AddrPortFrom(addr, uint16(addrs[i].NextHop.Port))
-		eps[i] = &ScionNetEndpoint{
+		eps[validPackets] = &ScionNetEndpoint{
 			StdNetEndpoint: StdNetEndpoint{
 				AddrPort: addrPort,
 			},
 			scionAddr: addrs[i],
 		}
+		validPackets++
 	}
-	return len(sizes), nil
+
+	// Zero out unused entries to prevent processing of stale data
+	for i := validPackets; i < maxCount && i < len(sizes); i++ {
+		sizes[i] = 0
+	}
+
+	return validPackets, nil
 }
 
 func (s *ScionNetBind) receiveSCION(conn *fastsnet.FastSCIONPacketConn,
@@ -365,7 +427,7 @@ func (s *ScionNetBind) Close() error {
 	defer s.mu.Unlock()
 
 	var firstErr error
-	
+
 	// Close SCION connection
 	if conn := s.scionConn.Swap(nil); conn != nil {
 		if err := conn.Close(); err != nil && firstErr == nil {
@@ -428,13 +490,38 @@ func (s *ScionNetBind) sendSCION(bufs [][]byte, ep *ScionNetEndpoint, conn *fast
 func (s *ScionNetBind) sendBatchSCION(bufs [][]byte, ep *ScionNetEndpoint, conn *fastsnet.FastSCIONPacketConn) error {
 	dst := ep.scionAddr
 
-	n, err := conn.WriteBatchTo(bufs, dst)
-	if err != nil {
-		return err
+	// Handle partial writes - keep sending until all packets are sent
+	totalSent := 0
+	remaining := bufs
+
+	for totalSent < len(bufs) {
+		n, err := conn.WriteBatchTo(remaining, dst)
+		if err != nil {
+			return fmt.Errorf("batch write failed after sending %d/%d packets: %w", totalSent, len(bufs), err)
+		}
+
+		totalSent += n
+
+		// If we sent everything, we're done
+		if totalSent >= len(bufs) {
+			return nil
+		}
+
+		// If no progress was made, there might be an issue
+		if n == 0 {
+			// Try individual sends as fallback
+			for i := range remaining {
+				if _, err := conn.WriteTo(remaining[i], dst); err != nil {
+					return fmt.Errorf("fallback send failed for packet %d: %w", totalSent+i, err)
+				}
+			}
+			return nil
+		}
+
+		// Continue with the remaining packets
+		remaining = remaining[n:]
 	}
-	if n != len(bufs) {
-		return fmt.Errorf("expected to write %d packets, wrote %d", len(bufs), n)
-	}
+
 	return nil
 }
 
@@ -475,7 +562,7 @@ func (s *ScionNetBind) BatchSize() int {
 	if scionNet := s.scionNetwork.Load(); scionNet != nil {
 		return scionNet.BatchSize
 	} else if runtime.GOOS == "linux" || runtime.GOOS == "android" {
-		return IdealBatchSize
+		return 32
 	}
 	return 1
 }
