@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fastsnet/fastsnet/pkg/fastsnet"
@@ -29,20 +30,21 @@ type ScionNetBind struct {
 	mu     sync.RWMutex
 	logger Logger
 
-	// SCION network and connections
-	scionNetwork  *fastsnet.FastSCIONNetwork
-	scionConn     *fastsnet.FastSCIONPacketConn
+	// SCION network and connections - protected by atomic operations for lock-free access
+	scionNetwork  atomic.Pointer[fastsnet.FastSCIONNetwork]
+	scionConn     atomic.Pointer[fastsnet.FastSCIONPacketConn]
+	
 	localAddr     *net.UDPAddr
 	daemonService daemon.Service
 	daemonConn    daemon.Connector
 
-	// Path management
-	pathManager *PathManager
+	// Path management - protected by atomic operations
+	pathManager atomic.Pointer[PathManager]
 
 	// Configuration
 	config *ScionConfig
 
-	// State
+	// State - immutable after initialization
 	useBatch bool
 }
 
@@ -166,25 +168,31 @@ func (s *ScionNetBind) initSCION() error {
 	}
 
 	// Initialize SCION network with proper topology
-	s.scionNetwork = &fastsnet.FastSCIONNetwork{
+	scionNet := &fastsnet.FastSCIONNetwork{
 		Topology:  s.daemonConn,
 		BatchSize: batchSize,
 	}
+	s.scionNetwork.Store(scionNet)
 
-	s.pathManager = NewPathManager(
+	pathMgr := NewPathManager(
 		s.daemonConn,        // SCION daemon connection
 		s.config.LocalIA,    // our IA
 		s.config.PathPolicy, // selection policy
 		s.logger,
 		WithRefreshInterval(5*time.Minute),
 	)
+	s.pathManager.Store(pathMgr)
 	s.logger.Verbosef("SCION network initialized with IA %s", s.config.LocalIA)
 
 	return nil
 }
 
 func (s *ScionNetBind) getUDPConn(localAddr *net.UDPAddr, port uint16) (*net.UDPConn, error) {
-	start, end, err := s.scionNetwork.Topology.PortRange(context.Background())
+	scionNet := s.scionNetwork.Load()
+	if scionNet == nil {
+		return nil, fmt.Errorf("SCION network not initialized")
+	}
+	start, end, err := scionNet.Topology.PortRange(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get port range: %w", err)
 	}
@@ -225,7 +233,7 @@ func (s *ScionNetBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.scionConn != nil {
+	if s.scionConn.Load() != nil {
 		return nil, 0, ErrBindAlreadyOpen
 	}
 
@@ -251,10 +259,16 @@ func (s *ScionNetBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 		return nil, 0, fmt.Errorf("failed to create UDP conn: %w", err)
 	}
 
-	s.scionConn = fastsnet.NewFastSCIONPacketConn(udpConn, s.scionNetwork.Topology,
-		s.scionNetwork.BatchSize)
+	scionNet := s.scionNetwork.Load()
+	if scionNet == nil {
+		return nil, 0, fmt.Errorf("SCION network not initialized")
+	}
+	
+	conn := fastsnet.NewFastSCIONPacketConn(udpConn, scionNet.Topology,
+		scionNet.BatchSize)
+	s.scionConn.Store(conn)
 
-	actualPort = uint16(s.scionConn.LocalAddr().(*snet.UDPAddr).Host.Port)
+	actualPort = uint16(conn.LocalAddr().(*snet.UDPAddr).Host.Port)
 
 	fns = append(fns, s.makeReceiveSCION())
 	s.logger.Verbosef("SCION listener started on port %d (non-batch)", actualPort)
@@ -268,15 +282,16 @@ func (s *ScionNetBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 
 func (s *ScionNetBind) makeReceiveSCION() ReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
-		if s.useBatch && s.scionConn != nil {
-			return s.receiveBatchSCION(s.scionConn, bufs, sizes, eps)
+		conn := s.scionConn.Load()
+		if conn == nil {
+			return 0, net.ErrClosed
 		}
 
-		if s.scionConn != nil {
-			return s.receiveSCION(s.scionConn, bufs, sizes, eps)
+		if s.useBatch {
+			return s.receiveBatchSCION(conn, bufs, sizes, eps)
 		}
 
-		return 0, fmt.Errorf("no suitable transport for endpoint")
+		return s.receiveSCION(conn, bufs, sizes, eps)
 	}
 }
 
@@ -350,18 +365,23 @@ func (s *ScionNetBind) Close() error {
 	defer s.mu.Unlock()
 
 	var firstErr error
-	if s.scionConn != nil {
-		if err := s.scionConn.Close(); err != nil && firstErr == nil {
+	
+	// Close SCION connection
+	if conn := s.scionConn.Swap(nil); conn != nil {
+		if err := conn.Close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("scion conn close: %w", err)
 		}
-		s.scionConn = nil
 	}
 
-	if s.pathManager != nil {
-		s.pathManager.Close()
-		s.pathManager = nil
+	// Close path manager
+	if pm := s.pathManager.Swap(nil); pm != nil {
+		pm.Close()
 	}
 
+	// Clear SCION network
+	s.scionNetwork.Store(nil)
+
+	// Close daemon connection
 	if s.daemonConn != nil {
 		if err := s.daemonConn.Close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("daemon conn close: %w", err)
@@ -383,15 +403,16 @@ func (s *ScionNetBind) Send(bufs [][]byte, ep Endpoint) error {
 		return ErrWrongEndpointType
 	}
 
-	if s.useBatch && s.scionConn != nil {
-		return s.sendBatchSCION(bufs, scionEp, s.scionConn)
+	conn := s.scionConn.Load()
+	if conn == nil {
+		return net.ErrClosed
 	}
 
-	if s.scionConn != nil {
-		return s.sendSCION(bufs, scionEp, s.scionConn)
+	if s.useBatch {
+		return s.sendBatchSCION(bufs, scionEp, conn)
 	}
 
-	return fmt.Errorf("no suitable transport for endpoint")
+	return s.sendSCION(bufs, scionEp, conn)
 }
 
 func (s *ScionNetBind) sendSCION(bufs [][]byte, ep *ScionNetEndpoint, conn *fastsnet.FastSCIONPacketConn) error {
@@ -429,7 +450,7 @@ func (s *ScionNetBind) ParseEndpoint(str string) (Endpoint, error) {
 			scionAddr: scionAddr,
 		}
 
-		pathManager := s.pathManager
+		pathManager := s.pathManager.Load()
 
 		if pathManager != nil {
 			pathManager.RegisterEndpoint(scionAddr.IA)
@@ -451,8 +472,8 @@ func (s *ScionNetBind) ParseEndpoint(str string) (Endpoint, error) {
 }
 
 func (s *ScionNetBind) BatchSize() int {
-	if s.scionNetwork != nil {
-		return s.scionNetwork.BatchSize
+	if scionNet := s.scionNetwork.Load(); scionNet != nil {
+		return scionNet.BatchSize
 	} else if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 		return IdealBatchSize
 	}
@@ -461,8 +482,8 @@ func (s *ScionNetBind) BatchSize() int {
 
 // Path management methods
 func (s *ScionNetBind) SetPathPolicy(policy string) {
-	if s.pathManager != nil {
-		s.pathManager.SetPolicy(policy)
+	if pm := s.pathManager.Load(); pm != nil {
+		pm.SetPolicy(policy)
 	}
 }
 
@@ -494,7 +515,7 @@ func convertIPToAddr(ip net.IP) (netip.Addr, error) {
 
 // GetPathsJSON returns a JSON string containing available paths for the given IA
 func (bind *ScionNetBind) GetPathsJSON(iaStr string) (string, error) {
-	pathManager := bind.pathManager
+	pathManager := bind.pathManager.Load()
 	if pathManager == nil {
 		return "", fmt.Errorf("path manager not initialized")
 	}
@@ -503,7 +524,7 @@ func (bind *ScionNetBind) GetPathsJSON(iaStr string) (string, error) {
 
 // SetPath sets a specific path for a destination IA
 func (bind *ScionNetBind) SetPath(iaStr string, pathIndex int) error {
-	pathManager := bind.pathManager
+	pathManager := bind.pathManager.Load()
 	if pathManager == nil {
 		return fmt.Errorf("path manager not initialized")
 	}
@@ -512,7 +533,7 @@ func (bind *ScionNetBind) SetPath(iaStr string, pathIndex int) error {
 
 // GetPathPolicy returns the current path selection policy
 func (bind *ScionNetBind) GetPathPolicy() string {
-	pathManager := bind.pathManager
+	pathManager := bind.pathManager.Load()
 	if pathManager == nil {
 		return "unknown"
 	}
