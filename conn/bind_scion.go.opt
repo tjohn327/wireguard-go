@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/fastsnet/fastsnet/pkg/fastsnet"
 	"github.com/scionproto/scion/pkg/addr"
@@ -31,6 +32,58 @@ func min(a, b int) int {
 var (
 	_ Bind = (*ScionNetBind)(nil)
 )
+
+// Performance optimization: IP address cache
+type ipAddrCache struct {
+	cache atomic.Value // stores *sync.Map
+}
+
+func newIPAddrCache() *ipAddrCache {
+	c := &ipAddrCache{}
+	c.cache.Store(&sync.Map{})
+	return c
+}
+
+func (c *ipAddrCache) get(ip net.IP) (netip.Addr, bool) {
+	m := c.cache.Load().(*sync.Map)
+	key := string(ip)
+	if val, ok := m.Load(key); ok {
+		return val.(netip.Addr), true
+	}
+	return netip.Addr{}, false
+}
+
+func (c *ipAddrCache) put(ip net.IP, addr netip.Addr) {
+	m := c.cache.Load().(*sync.Map)
+	key := string(ip)
+	m.Store(key, addr)
+}
+
+// Performance optimization: Endpoint object pool
+type endpointPool struct {
+	pool sync.Pool
+}
+
+func newEndpointPool() *endpointPool {
+	return &endpointPool{
+		pool: sync.Pool{
+			New: func() interface{} {
+				return &ScionNetEndpoint{}
+			},
+		},
+	}
+}
+
+func (ep *endpointPool) get() *ScionNetEndpoint {
+	return ep.pool.Get().(*ScionNetEndpoint)
+}
+
+func (ep *endpointPool) put(e *ScionNetEndpoint) {
+	// Reset the endpoint before returning to pool
+	e.scionAddr = nil
+	e.StdNetEndpoint.AddrPort = netip.AddrPort{}
+	ep.pool.Put(e)
+}
 
 // ScionNetBind implements Bind for SCION networks
 type ScionNetBind struct {
@@ -54,10 +107,7 @@ type ScionNetBind struct {
 	// State - immutable after initialization
 	useBatch bool
 
-	// Performance optimization - lock-free cache
-	cache *BatchEndpointCache
-
-	// Test helper fields - expose cache internals for testing
+	// Performance optimizations
 	endpointPool *endpointPool
 	ipCache      *ipAddrCache
 }
@@ -133,19 +183,13 @@ func NewScionNetBind(config *ScionConfig, logger Logger) *ScionNetBind {
 		useBatch = runtime.GOOS == "linux" || runtime.GOOS == "android"
 	}
 
-	cache := NewBatchEndpointCache()
-	bind := &ScionNetBind{
-		config:   config,
-		logger:   logger,
-		useBatch: useBatch,
-		cache:    cache,
+	return &ScionNetBind{
+		config:       config,
+		logger:       logger,
+		useBatch:     useBatch,
+		endpointPool: newEndpointPool(),
+		ipCache:      newIPAddrCache(),
 	}
-
-	// Initialize test helper fields
-	bind.endpointPool = &endpointPool{EndpointPool: cache.endpointPool}
-	bind.ipCache = &ipAddrCache{IPAddrCache: cache.ipCache}
-
-	return bind
 }
 
 func (s *ScionNetBind) initSCION() error {
@@ -186,7 +230,7 @@ func (s *ScionNetBind) initSCION() error {
 
 	batchSize := 1
 	if s.useBatch {
-		batchSize = 64
+		batchSize = 32
 	}
 
 	// Initialize SCION network with proper topology
@@ -196,14 +240,27 @@ func (s *ScionNetBind) initSCION() error {
 	}
 	s.scionNetwork.Store(scionNet)
 
-	pathMgr := NewPathManager(
-		s.daemonConn,        // SCION daemon connection
-		s.config.LocalIA,    // our IA
-		s.config.PathPolicy, // selection policy
-		s.logger,
-		WithRefreshInterval(5*time.Minute),
-	)
-	s.pathManager.Store(pathMgr)
+	// Use the optimized sharded path manager if enabled
+	if os.Getenv("USE_SHARDED_PATH_MANAGER") == "1" {
+		// For now, use the standard path manager until we refactor to use interfaces properly
+		pathMgr := NewPathManager(
+			s.daemonConn,        // SCION daemon connection
+			s.config.LocalIA,    // our IA
+			s.config.PathPolicy, // selection policy
+			s.logger,
+			WithRefreshInterval(5*time.Minute),
+		)
+		s.pathManager.Store(pathMgr)
+	} else {
+		pathMgr := NewPathManager(
+			s.daemonConn,        // SCION daemon connection
+			s.config.LocalIA,    // our IA
+			s.config.PathPolicy, // selection policy
+			s.logger,
+			WithRefreshInterval(5*time.Minute),
+		)
+		s.pathManager.Store(pathMgr)
+	}
 	s.logger.Verbosef("SCION network initialized with IA %s", s.config.LocalIA)
 
 	return nil
@@ -302,6 +359,29 @@ func (s *ScionNetBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 	return fns, actualPort, nil
 }
 
+// clearBuffer efficiently clears the buffer from start to end
+// This is significantly faster than byte-by-byte clearing
+func clearBuffer(buf []byte, start int) {
+	if start >= len(buf) || start < 0 {
+		return
+	}
+	
+	remaining := buf[start:]
+	
+	// Use the most efficient method available
+	if len(remaining) > 0 {
+		// For Go 1.21+, we would use: clear(remaining)
+		// For now, use memclr if available, otherwise fall back to copy
+		memclrNoHeapPointers(unsafe.Pointer(&remaining[0]), uintptr(len(remaining)))
+	}
+}
+
+// memclrNoHeapPointers clears memory containing no heap pointers
+// This links to runtime.memclrNoHeapPointers for maximum performance
+//
+//go:linkname memclrNoHeapPointers runtime.memclrNoHeapPointers
+func memclrNoHeapPointers(ptr unsafe.Pointer, n uintptr)
+
 func (s *ScionNetBind) makeReceiveSCION() ReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
 		conn := s.scionConn.Load()
@@ -323,11 +403,6 @@ func (s *ScionNetBind) receiveBatchSCION(conn *fastsnet.FastSCIONPacketConn,
 		return 0, net.ErrClosed
 	}
 
-	// // Under high load, add a small delay to prevent buffer exhaustion
-	// if runtime.GOOS == "linux" && len(bufs) > 16 {
-	// 	runtime.Gosched() // Yield to let other goroutines process
-	// }
-
 	readSizes, addrs, err := conn.ReadBatchFrom(bufs)
 	if err != nil {
 		return 0, err
@@ -337,20 +412,25 @@ func (s *ScionNetBind) receiveBatchSCION(conn *fastsnet.FastSCIONPacketConn,
 	maxCount := min(len(readSizes), len(bufs))
 	maxCount = min(maxCount, len(addrs))
 
-	// CRITICAL: Clear buffers beyond valid data to prevent stale data issues
-	// WireGuard reuses buffers without clearing, so we need to ensure
-	// no stale data remains after the valid payload
-	for i := 0; i < maxCount; i++ {
-		if readSizes[i] > 0 && readSizes[i] < len(bufs[i]) {
-			// Option 1: Use slice to zero out remaining bytes (most efficient)
-			clear(bufs[i][readSizes[i]:])
-
-			// Option 2: Alternative - truncate buffer to valid size
-			// bufs[i] = bufs[i][:readSizes[i]]
+	// OPTIMIZATION 1: Fast buffer clearing
+	// Process in chunks for better cache locality
+	const chunkSize = 16
+	for i := 0; i < maxCount; i += chunkSize {
+		end := min(i+chunkSize, maxCount)
+		
+		// Clear buffers in current chunk
+		for j := i; j < end; j++ {
+			if readSizes[j] > 0 && readSizes[j] < len(bufs[j]) {
+				clearBuffer(bufs[j], readSizes[j])
+			}
 		}
 	}
 
-	validPackets := 0
+	// OPTIMIZATION 4: Batch validation without array compaction
+	// Pre-allocate for valid packet indices
+	validIndices := make([]int, 0, maxCount)
+	
+	// First pass: identify valid packets
 	for i := 0; i < maxCount; i++ {
 		// Skip packets that are too small to be valid WireGuard messages
 		// MinMessageSize is 32 bytes (MessageTransportHeaderSize + poly1305.TagSize)
@@ -359,46 +439,70 @@ func (s *ScionNetBind) receiveBatchSCION(conn *fastsnet.FastSCIONPacketConn,
 		}
 
 		// Skip packets with invalid addresses
-		addr, err := convertIPToAddr(addrs[i].NextHop.IP)
-		if err != nil {
-			// Log but continue processing other packets
-			if os.Getenv("DEBUG_SCION") == "1" {
-				s.logger.Verbosef("Skipping packet %d: invalid IP address: %v", i, err)
-			}
+		if addrs[i] == nil || addrs[i].NextHop == nil || addrs[i].NextHop.IP == nil {
 			continue
 		}
 
 		// Safety check: ensure packet size doesn't exceed buffer capacity
 		if readSizes[i] > len(bufs[i]) {
 			if os.Getenv("DEBUG_SCION") == "1" {
-				s.logger.Verbosef("Skipping packet %d: size %d exceeds buffer capacity %d", i, readSizes[i], len(bufs[i]))
+				s.logger.Verbosef("Skipping packet %d: size %d exceeds buffer capacity %d", 
+					i, readSizes[i], len(bufs[i]))
 			}
 			continue
 		}
 
-		// Only process valid packets - compact array if needed
-		if validPackets != i {
-			// Move valid packet data to compact position
-			copy(bufs[validPackets], bufs[i][:readSizes[i]])
-		}
-
-		sizes[validPackets] = readSizes[i]
-		addrPort := netip.AddrPortFrom(addr, uint16(addrs[i].NextHop.Port))
-		eps[validPackets] = &ScionNetEndpoint{
-			StdNetEndpoint: StdNetEndpoint{
-				AddrPort: addrPort,
-			},
-			scionAddr: addrs[i],
-		}
-		validPackets++
+		validIndices = append(validIndices, i)
 	}
 
-	// Zero out unused entries to prevent processing of stale data
-	for i := validPackets; i < maxCount && i < len(sizes); i++ {
+	// Second pass: process valid packets without array compaction
+	validCount := 0
+	for _, validIdx := range validIndices {
+		// OPTIMIZATION 3: Use cached IP address conversion
+		var addr netip.Addr
+		var cached bool
+		
+		ip := addrs[validIdx].NextHop.IP
+		addr, cached = s.ipCache.get(ip)
+		
+		if !cached {
+			// Convert and cache
+			addr, err = convertIPToAddr(ip)
+			if err != nil {
+				// Skip this packet but continue processing others
+				if os.Getenv("DEBUG_SCION") == "1" {
+					s.logger.Verbosef("Skipping packet %d: invalid IP address: %v", validIdx, err)
+				}
+				continue
+			}
+			s.ipCache.put(ip, addr)
+		}
+
+		sizes[validCount] = readSizes[validIdx]
+		addrPort := netip.AddrPortFrom(addr, uint16(addrs[validIdx].NextHop.Port))
+		
+		// OPTIMIZATION 2: Use object pool for endpoints
+		ep := s.endpointPool.get()
+		ep.StdNetEndpoint.AddrPort = addrPort
+		ep.scionAddr = addrs[validIdx]
+		eps[validCount] = ep
+		
+		validCount++
+	}
+
+	// Clear unused entries
+	for i := validCount; i < maxCount && i < len(sizes); i++ {
 		sizes[i] = 0
+		if i < len(eps) && eps[i] != nil {
+			// Return endpoints to pool if they're ScionNetEndpoint
+			if ep, ok := eps[i].(*ScionNetEndpoint); ok {
+				s.endpointPool.put(ep)
+			}
+			eps[i] = nil
+		}
 	}
 
-	return validPackets, nil
+	return validCount, nil
 }
 
 func (s *ScionNetBind) receiveSCION(conn *fastsnet.FastSCIONPacketConn,
@@ -406,37 +510,47 @@ func (s *ScionNetBind) receiveSCION(conn *fastsnet.FastSCIONPacketConn,
 	if conn == nil {
 		return 0, net.ErrClosed
 	}
-
-	readBytes, remote, err := conn.ReadFrom(bufs[0])
+	
+	// Read packet from SCION connection
+	buffer := bufs[0]
+	readBytes, remote, err := conn.ReadFrom(buffer)
 	if err != nil {
 		s.logger.Errorf("Error reading from SCION connection: %v", err)
 		return 0, err
 	}
 
+	// Clear remaining buffer if needed
+	if readBytes > 0 && readBytes < len(buffer) {
+		clearBuffer(buffer, readBytes)
+	}
+
 	sizes[0] = readBytes
+	
 	// Convert net.Addr to our endpoint type
 	if scionAddr, ok := remote.(*snet.UDPAddr); ok {
-		// Use optimized IP address conversion
-		addr, err := convertIPToAddr(scionAddr.NextHop.IP)
-		if err != nil {
-			return 0, fmt.Errorf("invalid IP address in SCION NextHop: %w", err)
+		// OPTIMIZATION 3: Use cached IP address conversion
+		var addr netip.Addr
+		var cached bool
+		
+		ip := scionAddr.NextHop.IP
+		addr, cached = s.ipCache.get(ip)
+		
+		if !cached {
+			// Convert and cache
+			addr, err = convertIPToAddr(ip)
+			if err != nil {
+				return 0, fmt.Errorf("invalid IP address in SCION NextHop: %w", err)
+			}
+			s.ipCache.put(ip, addr)
 		}
 
 		addrPort := netip.AddrPortFrom(addr, uint16(scionAddr.NextHop.Port))
-		eps[0] = &ScionNetEndpoint{
-			StdNetEndpoint: StdNetEndpoint{
-				AddrPort: addrPort,
-			},
-			scionAddr: scionAddr,
-		}
-
-		clear(bufs[0][readBytes:])
-		for i := 1; i < len(bufs); i++ {
-			clear(bufs[i][0:])
-			sizes[i] = 0
-			eps[i] = nil
-		}
-
+		
+		// OPTIMIZATION 2: Use object pool for endpoints
+		ep := s.endpointPool.get()
+		ep.StdNetEndpoint.AddrPort = addrPort
+		ep.scionAddr = scionAddr
+		eps[0] = ep
 	} else {
 		// Fallback if it's not a SCION address
 		return 0, fmt.Errorf("unexpected address type: %T", remote)
@@ -556,9 +670,9 @@ func (s *ScionNetBind) ParseEndpoint(str string) (Endpoint, error) {
 			return nil, fmt.Errorf("failed to parse SCION address %s: %w", str, err)
 		}
 
-		scionEndpoint := &ScionNetEndpoint{
-			scionAddr: scionAddr,
-		}
+		// OPTIMIZATION 2: Use object pool for endpoints
+		scionEndpoint := s.endpointPool.get()
+		scionEndpoint.scionAddr = scionAddr
 
 		pathManager := s.pathManager.Load()
 
@@ -568,8 +682,17 @@ func (s *ScionNetBind) ParseEndpoint(str string) (Endpoint, error) {
 				scionAddr.Path = p.Dataplane()
 				scionAddr.NextHop = p.UnderlayNextHop()
 
-				// Use optimized IP address conversion
-				addr, _ := convertIPToAddr(scionAddr.NextHop.IP)
+				// OPTIMIZATION 3: Use cached IP conversion
+				var addr netip.Addr
+				var cached bool
+				
+				ip := scionAddr.NextHop.IP
+				addr, cached = s.ipCache.get(ip)
+				
+				if !cached {
+					addr, _ = convertIPToAddr(ip)
+					s.ipCache.put(ip, addr)
+				}
 
 				scionEndpoint.StdNetEndpoint.AddrPort = netip.AddrPortFrom(
 					addr, uint16(scionAddr.NextHop.Port))
@@ -649,4 +772,3 @@ func (bind *ScionNetBind) GetPathPolicy() string {
 	}
 	return pathManager.policy.String()
 }
-

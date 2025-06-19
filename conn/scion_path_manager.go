@@ -687,3 +687,8 @@ func (pm *PathManager) handleSetPath() http.HandlerFunc {
 		fmt.Fprint(w, "Path successfully set") // Simple confirmation message
 	}
 }
+
+// GetPathPolicy returns the current path selection policy
+func (pm *PathManager) GetPathPolicy() string {
+	return pm.policy.String()
+}
