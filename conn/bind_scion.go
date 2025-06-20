@@ -53,10 +53,10 @@ type ScionNetBind struct {
 
 // connData holds frequently accessed connection data to reduce lock contention
 type connData struct {
-	batchConn     *ScionBatchConn
-	scionConn     *snet.Conn
-	pathManager   *PathManager
-	useBatch      bool
+	batchConn   *ScionBatchConn
+	scionConn   *snet.Conn
+	pathManager *PathManager
+	useBatch    bool
 	// Batch connection fields
 	ipv4PC        *ipv4.PacketConn
 	ipv6PC        *ipv6.PacketConn
@@ -207,7 +207,7 @@ func (s *ScionNetBind) updateCachedConnData() {
 	s.cachedConnData.scionConn = s.scionConn
 	s.cachedConnData.pathManager = s.pathManager
 	s.cachedConnData.useBatch = s.useBatch
-	
+
 	if s.batchConn != nil {
 		s.cachedConnData.ipv4PC = s.batchConn.ipv4PC
 		s.cachedConnData.ipv6PC = s.batchConn.ipv6PC
@@ -299,10 +299,10 @@ func (s *ScionNetBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 			scmpHandler := s.scionNetwork.SCMPHandler
 			s.batchConn.SetSCMPHandler(scmpHandler)
 			actualPort = uint16(s.batchConn.LocalAddr().(*net.UDPAddr).Port)
-			
+
 			// Update cached connection data
 			s.updateCachedConnData()
-			
+
 			fns = append(fns, s.makeReceiveSCION())
 			s.logger.Verbosef("SCION batch listener started on port %d", actualPort)
 		}
@@ -317,10 +317,10 @@ func (s *ScionNetBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 		}
 		s.scionConn = conn
 		actualPort = uint16(s.scionConn.LocalAddr().(*snet.UDPAddr).Host.Port)
-		
+
 		// Update cached connection data
 		s.updateCachedConnData()
-		
+
 		fns = append(fns, s.makeReceiveSCION())
 		s.logger.Verbosef("SCION listener started on port %d (non-batch)", actualPort)
 	}
@@ -374,7 +374,7 @@ func (s *ScionNetBind) receiveSCION(scionConn *snet.Conn, bufs [][]byte, sizes [
 		if err != nil {
 			return 0, fmt.Errorf("invalid IP address in SCION NextHop: %w", err)
 		}
-		
+
 		addrPort := netip.AddrPortFrom(addr, uint16(scionAddr.NextHop.Port))
 		eps[0] = &ScionNetEndpoint{
 			StdNetEndpoint: StdNetEndpoint{
@@ -498,12 +498,14 @@ func (s *ScionNetBind) ParseEndpoint(str string) (Endpoint, error) {
 			if p, err := pathManager.GetPath(scionAddr.IA); err == nil {
 				scionAddr.Path = p.Dataplane()
 				scionAddr.NextHop = p.UnderlayNextHop()
-				
+
 				// Use optimized IP address conversion
 				addr, _ := convertIPToAddr(scionAddr.NextHop.IP)
-				
+
 				scionEndpoint.StdNetEndpoint.AddrPort = netip.AddrPortFrom(
 					addr, uint16(scionAddr.NextHop.Port))
+			} else {
+				return nil, fmt.Errorf("failed to get path for IA %s: %w", scionAddr.IA, err)
 			}
 		}
 		return scionEndpoint, nil

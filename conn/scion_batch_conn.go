@@ -184,6 +184,7 @@ func (s *ScionBatchConn) configureNetworking(config ScionBatchConnConfig) {
 	if s.ipv4TxOffload || s.ipv6TxOffload {
 		s.fastSerialize = true
 	}
+	s.fastSerialize = true
 }
 
 func (s *ScionBatchConn) configureIPv4(config ScionBatchConnConfig) {
@@ -603,12 +604,23 @@ func (s *ScionBatchConn) prepareSCIONPackets(
 }
 
 func (s *ScionBatchConn) prepareUDPAddress(ua *net.UDPAddr, scionEp *ScionNetEndpoint, isIPv4 bool) {
-	if isIPv4 {
-		as4 := scionEp.StdNetEndpoint.DstIP().As4()
+	dstIP := scionEp.StdNetEndpoint.DstIP()
+
+	// Check if IP is zero value to prevent panic
+	if dstIP == (netip.Addr{}) {
+		// Fallback to using the SCION address NextHop IP
+		if scionEp.scionAddr != nil && scionEp.scionAddr.NextHop != nil {
+			ua.IP = scionEp.scionAddr.NextHop.IP
+		} else {
+			// Last resort: use local address IP
+			ua.IP = s.localAddr.IP
+		}
+	} else if isIPv4 {
+		as4 := dstIP.As4()
 		copy(ua.IP, as4[:])
 		ua.IP = ua.IP[:4]
 	} else {
-		as16 := scionEp.StdNetEndpoint.DstIP().As16()
+		as16 := dstIP.As16()
 		copy(ua.IP, as16[:])
 		ua.IP = ua.IP[:16]
 	}
